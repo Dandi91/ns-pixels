@@ -197,7 +197,7 @@ where
 
 fn map_train_type(s: &str) -> TrainType {
     // NS returns mixed-case strings like "Flirt", "VIRM-VI", "ICM-III".
-    // Strip subtype suffix and normalise to uppercase before matching.
+    // Strip subtype suffix and normalize to uppercase before matching.
     let head = s.trim().split(['-', ' ']).next().unwrap_or(s);
     let mut buf = [0u8; 16];
     let n = head.len().min(buf.len());

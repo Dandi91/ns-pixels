@@ -4,6 +4,7 @@
 extern crate alloc;
 
 pub mod decompress;
+pub mod feed;
 pub mod ns_api;
 pub mod projection;
 pub mod registry;
