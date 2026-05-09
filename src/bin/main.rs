@@ -6,39 +6,27 @@ extern crate alloc;
 
 use embassy_executor::Spawner;
 use embassy_net::{
-    Runner,
-    StackResources,
-    dns::DnsSocket,
+    Runner, StackResources,
     dns::DnsQueryType,
-    tcp::client::{TcpClient, TcpClientState},
+    dns::DnsSocket,
     tcp::TcpSocket,
+    tcp::client::{TcpClient, TcpClientState},
 };
 use embassy_time::{Duration, Instant, Timer};
 use esp_alloc as _;
 use esp_backtrace as _;
 use esp_hal::{
-    clock::CpuClock,
-    interrupt::software::SoftwareInterruptControl,
-    ram,
-    rng::Rng,
+    clock::CpuClock, interrupt::software::SoftwareInterruptControl, ram, rng::Rng,
     timer::timg::TimerGroup,
 };
-use esp_println::println;
-use esp_radio::wifi::{
-    Config,
-    ControllerConfig,
-    Interface,
-    WifiController,
-    sta::StationConfig,
-};
-use reqwless::{
-    client::HttpClient,
-    request::{Method, RequestBuilder},
-};
 use esp_hub75::Hub75Pins16;
+use esp_println::println;
+use esp_radio::wifi::{Config, ControllerConfig, Interface, WifiController, sta::StationConfig};
 use ns_pixels::{
     decompress::Decompressor,
-    projection::{PixelCoord, wgs84_to_matrix},
+    ns_api::{self, NewTrainQueue},
+    projection::wgs84_to_matrix,
+    registry::{Registry, SharedRegistry},
     xml_parser::{self, Train},
     zmq,
 };
@@ -86,7 +74,7 @@ async fn main(spawner: Spawner) -> ! {
         peripherals.WIFI,
         ControllerConfig::default().with_initial_config(station_config),
     )
-        .unwrap();
+    .unwrap();
     println!("Wifi configured and started!");
 
     let wifi_interface = interfaces.station;
@@ -100,7 +88,7 @@ async fn main(spawner: Spawner) -> ! {
     let (stack, runner) = embassy_net::new(
         wifi_interface,
         config,
-        mk_static!(StackResources<3>, StackResources::<3>::new()),
+        mk_static!(StackResources<4>, StackResources::<4>::new()),
         seed,
     );
 
@@ -113,9 +101,13 @@ async fn main(spawner: Spawner) -> ! {
         println!("Got IP: {}", config.address);
     }
 
-    let dns_client = DnsSocket::new(stack);
-    let result = dns_client.query("pubsub.besteffort.ndovloket.nl", DnsQueryType::A).await;
-    let peer_ip = result.unwrap()[0];
+    let peer_ip = {
+        let dns_client = DnsSocket::new(stack);
+        let result = dns_client
+            .query("pubsub.besteffort.ndovloket.nl", DnsQueryType::A)
+            .await;
+        result.unwrap()[0]
+    };
     println!("Got peer IP: {}", peer_ip);
 
     let rx_buf = mk_static!([u8; 4096], [0u8; 4096]);
@@ -123,7 +115,9 @@ async fn main(spawner: Spawner) -> ! {
     let mut socket = TcpSocket::new(stack, rx_buf, tx_buf);
     socket.connect((peer_ip, 7664)).await.unwrap();
     let mut sub = zmq::Subscriber::new(socket, 64 * 1024).await.unwrap();
-    sub.subscribe(b"/RIG/NStreinpositiesInterface5").await.unwrap();
+    sub.subscribe(b"/RIG/NStreinpositiesInterface5")
+        .await
+        .unwrap();
 
     // Decompressor owns the InflateState (~43 KiB) and a 400 KiB output buffer, both in PSRAM.
     // Typical decompressed XML is ~300 KiB; 400 KiB gives headroom for busy moments.
@@ -133,12 +127,20 @@ async fn main(spawner: Spawner) -> ! {
         decompressor.capacity() / 1024
     );
 
-    // Per-message scratch space, reused across iterations. Allocated in
-    // PSRAM since they can grow into the thousands of entries.
-    let mut trains: alloc::vec::Vec<Train, _> =
-        alloc::vec::Vec::new_in(esp_alloc::ExternalMemory);
-    let mut coords: alloc::vec::Vec<PixelCoord, _> =
-        alloc::vec::Vec::new_in(esp_alloc::ExternalMemory);
+    // Per-message scratch space, reused across iterations. PSRAM-backed
+    // because train counts can spike into the thousands.
+    let mut trains: alloc::vec::Vec<Train, _> = alloc::vec::Vec::new_in(esp_alloc::ExternalMemory);
+
+    // Live registry + new-train channel, both static so the API task can
+    // borrow them. The registry itself lives on the default (internal SRAM)
+    // heap for cache-friendly iteration during rendering.
+    let registry: &'static SharedRegistry =
+        mk_static!(SharedRegistry, SharedRegistry::new(Registry::new()));
+    let new_train_q: &'static NewTrainQueue = mk_static!(NewTrainQueue, NewTrainQueue::new());
+    spawner.spawn(ns_api::run(stack, registry, new_train_q, seed).unwrap());
+
+    // Trains not seen in this many seconds are dropped from the registry.
+    const STALE_AFTER: Duration = Duration::from_secs(60);
 
     loop {
         let frames = sub.recv().await.unwrap();
@@ -163,17 +165,46 @@ async fn main(spawner: Spawner) -> ! {
         xml_parser::parse(xml, |t| trains.push(t));
         let parse_ms = start.elapsed().as_millis() - inflate_ms;
 
-        coords.clear();
-        coords.extend(trains.iter().map(|t| wgs84_to_matrix(t.lat, t.lon)));
+        let now = Instant::now();
+        let cutoff = now.checked_sub(STALE_AFTER).unwrap_or(now);
+
+        let mut new_count = 0u32;
+        let mut dropped = 0u32;
+        let mut evicted = 0;
+        let registry_len;
+        let unknowns;
+        {
+            let mut reg = registry.lock().await;
+            if cutoff != now {
+                evicted = reg.evict_older_than(cutoff);
+            }
+            for t in &trains {
+                let pixel = wgs84_to_matrix(t.lat, t.lon);
+                if reg.upsert(t.number, pixel, now) {
+                    new_count += 1;
+                    if new_train_q.try_send(t.number).is_err() {
+                        dropped += 1;
+                    }
+                }
+            }
+            registry_len = reg.len();
+            unknowns = reg.unknown_count();
+        }
         let total_ms = start.elapsed().as_millis();
 
         println!(
-            "{} KiB XML, {} trains: inflate {} ms, parse {} ms, total {} ms",
+            "{} KiB XML, {} trains: inflate {} ms, parse {} ms, total {} ms; \
+             registry {} ({} unknown, +{} new, -{} stale, {} wake-skip)",
             xml_kib,
             trains.len(),
             inflate_ms,
             parse_ms,
             total_ms,
+            registry_len,
+            unknowns,
+            new_count,
+            evicted,
+            dropped,
         );
     }
 }
