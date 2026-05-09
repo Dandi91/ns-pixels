@@ -36,10 +36,6 @@ impl Decompressor {
         Self { state, buf }
     }
 
-    pub fn capacity(&self) -> usize {
-        self.buf.len()
-    }
-
     /// Strip the gzip header from `payload`, inflate the body into the PSRAM
     /// buffer, and return the result as a UTF-8 string slice.
     pub fn inflate_gzip(&mut self, payload: &[u8]) -> Result<&str, Error> {

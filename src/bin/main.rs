@@ -74,8 +74,13 @@ async fn main(spawner: Spawner) -> ! {
         clock: peripherals.GPIO12.degrade(),
         latch: peripherals.GPIO10.degrade(),
     };
+
+    let registry: &'static SharedRegistry = mk_static!(SharedRegistry, Registry::new().into());
+    let queue: &'static NewTrainQueue = mk_static!(NewTrainQueue, NewTrainQueue::new());
+
     display::start(
         display_peripherals,
+        registry,
         peripherals.CPU_CTRL,
         sw_int.software_interrupt1,
         sw_int.software_interrupt2,
@@ -119,19 +124,12 @@ async fn main(spawner: Spawner) -> ! {
         println!("Got IP: {}", config.address);
     }
 
-    // Live registry + new-train channel, both static so worker tasks can
-    // borrow them. The registry itself lives on the default (internal SRAM)
-    // heap for cache-friendly iteration during rendering.
-    let registry: &'static SharedRegistry = mk_static!(SharedRegistry, Registry::new().into());
-    let queue: &'static NewTrainQueue = mk_static!(NewTrainQueue, NewTrainQueue::new());
-
     spawner.spawn(feed::run(stack, registry, queue).unwrap());
     spawner.spawn(ns_api::run(stack, registry, queue, seed).unwrap());
 
     // Main has nothing more to do; tasks own the work loops.
     loop {
-        Timer::after(Duration::from_secs(60)).await;
-        println!("{}", esp_alloc::HEAP.stats());
+        Timer::after(Duration::from_secs(3600)).await;
     }
 }
 

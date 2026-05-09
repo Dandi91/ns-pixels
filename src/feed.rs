@@ -61,10 +61,6 @@ pub async fn run(
     // Decompressor owns a ~43 KiB InflateState plus the XML output buffer
     // (default 400 KiB). Both live in PSRAM.
     let mut decompressor = Decompressor::new(XML_BUF_LEN);
-    println!(
-        "feed: decompressor allocated in PSRAM ({} KiB buffer)",
-        decompressor.capacity() / 1024
-    );
 
     // Per-message scratch space, reused across iterations. PSRAM-backed
     // because train counts can spike into the thousands.

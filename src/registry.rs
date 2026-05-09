@@ -3,7 +3,7 @@
 //! Backed by [`heapless::FnvIndexMap`] in internal SRAM for cache-friendly
 //! iteration during rendering. Capacity is fixed at compile time.
 
-use embassy_sync::blocking_mutex::raw::NoopRawMutex;
+use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::mutex::Mutex;
 use embassy_time::Instant;
 use heapless::{FnvIndexMap, Vec};
@@ -106,4 +106,6 @@ impl Registry {
     }
 }
 
-pub type SharedRegistry = Mutex<NoopRawMutex, Registry>;
+// `CriticalSectionRawMutex` so the rendering task on core 1 can safely lock
+// the registry that the feed/ns_api tasks update on core 0.
+pub type SharedRegistry = Mutex<CriticalSectionRawMutex, Registry>;

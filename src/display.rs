@@ -29,6 +29,9 @@ use esp_hub75::{
 use esp_println::println;
 use esp_rtos::embassy::{Executor, InterruptExecutor};
 
+use crate::registry::SharedRegistry;
+use crate::train::TrainType;
+
 pub const ROWS: usize = 64;
 pub const COLS: usize = 64;
 pub const NROWS: usize = compute_rows(ROWS);
@@ -38,6 +41,8 @@ pub type FBType = DmaFrameBuffer<NROWS, COLS, PLANES>;
 type FrameBufferExchange = Signal<CriticalSectionRawMutex, &'static mut FBType>;
 
 const DISPLAY_STACK_SIZE: usize = 8192;
+const FPS_SECONDS: u32 = 10;
+const FPS_INTERVAL: Duration = Duration::from_secs(FPS_SECONDS as u64);
 
 static REFRESH_RATE: AtomicU32 = AtomicU32::new(0);
 static RENDER_RATE: AtomicU32 = AtomicU32::new(0);
@@ -81,6 +86,7 @@ macro_rules! mk_static {
 /// second core has been started.
 pub fn start(
     peripherals: DisplayPeripherals<'static>,
+    registry: &'static SharedRegistry,
     cpu_ctrl: CPU_CTRL<'static>,
     sw_int_core: SoftwareInterrupt<'static, 1>,
     sw_int_hp: SoftwareInterrupt<'static, 2>,
@@ -123,7 +129,7 @@ pub fn start(
 
         let lp_executor = mk_static!(Executor, Executor::new());
         lp_executor.run(|spawner: Spawner| {
-            spawner.spawn(display_task(&TX, &RX, fb0).unwrap());
+            spawner.spawn(display_task(registry, &TX, &RX, fb0).unwrap());
         });
     };
 
@@ -132,30 +138,29 @@ pub fn start(
 
 #[embassy_executor::task]
 async fn display_task(
+    registry: &'static SharedRegistry,
     rx: &'static FrameBufferExchange,
     tx: &'static FrameBufferExchange,
     mut fb: &'static mut FBType,
 ) {
     println!("display_task: starting!");
-    let mut frame: u32 = 0;
     let mut count = 0u32;
     let mut start = Instant::now();
 
     loop {
         fb.erase();
-        draw_placeholder(fb, frame);
-        frame = frame.wrapping_add(1);
+        draw_trains(fb, registry).await;
 
         tx.signal(fb);
         fb = rx.wait().await;
 
         count += 1;
-        if start.elapsed() > Duration::from_secs(1) {
+        if start.elapsed() > FPS_INTERVAL {
             RENDER_RATE.store(count, Ordering::Relaxed);
             println!(
                 "display: render {} fps, refresh {} Hz",
-                count,
-                REFRESH_RATE.load(Ordering::Relaxed)
+                count / FPS_SECONDS,
+                REFRESH_RATE.load(Ordering::Relaxed) / FPS_SECONDS,
             );
             count = 0;
             start = Instant::now();
@@ -178,7 +183,7 @@ async fn hub75_task(
         owned.pins,
         owned.dma_channel,
         descriptors,
-        Rate::from_mhz(20),
+        Rate::from_mhz(16),
     )
     .expect("failed to create Hub75!");
 
@@ -214,7 +219,7 @@ async fn hub75_task(
         }
 
         count += 1;
-        if start.elapsed() > Duration::from_secs(1) {
+        if start.elapsed() > FPS_INTERVAL {
             REFRESH_RATE.store(count, Ordering::Relaxed);
             count = 0;
             start = Instant::now();
@@ -222,19 +227,29 @@ async fn hub75_task(
     }
 }
 
-/// Placeholder pattern: animated RGB gradient bands. Replaced once the
-/// registry is wired in.
-fn draw_placeholder(fb: &mut FBType, frame: u32) {
-    use embedded_graphics::prelude::*;
-    const STEP: u8 = (256 / COLS) as u8;
-    let phase = (frame & 0x3F) as i32;
-    let bar_h = (ROWS as i32) / 3;
-    for x in 0..COLS as i32 {
-        let bright = (x as u8).wrapping_add(phase as u8).wrapping_mul(STEP);
-        for y in 0..bar_h {
-            fb.set_pixel(Point::new(x, y), Color::new(bright, 0, 0));
-            fb.set_pixel(Point::new(x, y + bar_h), Color::new(0, bright, 0));
-            fb.set_pixel(Point::new(x, y + 2 * bar_h), Color::new(0, 0, bright));
+/// Plot every train in the registry as one pixel coloured by [`TrainType`].
+/// Holds the registry mutex only for the duration of the iteration.
+async fn draw_trains(fb: &mut FBType, registry: &SharedRegistry) {
+    use embedded_graphics::prelude::Point;
+    let reg = registry.lock().await;
+    for (_, state) in reg.iter() {
+        if !state.pixel.is_on_screen() {
+            continue;
         }
+        let p = Point::new(state.pixel.x as i32, state.pixel.y as i32);
+        fb.set_pixel(p, color_for(state.typ));
+    }
+}
+
+fn color_for(typ: TrainType) -> Color {
+    match typ {
+        TrainType::SNG => Color::new(255, 80, 0),    // orange
+        TrainType::SLT => Color::new(0, 200, 255),   // cyan
+        TrainType::Flirt => Color::new(255, 0, 200), // magenta
+        TrainType::ICM => Color::new(255, 220, 0),   // yellow
+        TrainType::DDZ => Color::new(0, 255, 80),    // green
+        TrainType::VIRM => Color::new(80, 80, 255),  // blue
+        TrainType::ICNG => Color::new(255, 255, 255),
+        TrainType::Unknown => Color::new(40, 40, 40), // dim grey
     }
 }
