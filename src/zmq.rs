@@ -70,10 +70,7 @@ impl<S: Read + Write> Subscriber<S> {
     }
 
     async fn handshake(&mut self) -> Result<(), Error<S::Error>> {
-        self.socket
-            .write_all(&GREETING)
-            .await
-            .map_err(Error::Io)?;
+        self.socket.write_all(&GREETING).await.map_err(Error::Io)?;
         self.socket.flush().await.map_err(Error::Io)?;
 
         let mut peer = [0u8; 64];

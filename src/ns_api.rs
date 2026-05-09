@@ -6,13 +6,13 @@
 
 use core::fmt::Write as _;
 
-use embassy_futures::select::{Either, select};
+use embassy_futures::select::select;
 use embassy_net::Stack;
 use embassy_net::dns::DnsSocket;
 use embassy_net::tcp::client::{TcpClient, TcpClientState};
 use embassy_sync::blocking_mutex::raw::NoopRawMutex;
 use embassy_sync::channel::Channel;
-use embassy_time::{Duration, Instant, Timer};
+use embassy_time::{Duration, Timer};
 use heapless::{String, Vec};
 use reqwless::{
     client::{HttpClient, TlsConfig, TlsVerify},
@@ -66,18 +66,12 @@ pub async fn run(
     log::info!("ns_api enrichment task started");
 
     // PSRAM-backed scratch space — TLS bufs are too large for internal SRAM.
-    let mut tls_read = alloc::boxed::Box::<[u8], _>::new_uninit_slice_in(
-        TLS_BUF_LEN,
-        esp_alloc::ExternalMemory,
-    );
-    let mut tls_write = alloc::boxed::Box::<[u8], _>::new_uninit_slice_in(
-        TLS_BUF_LEN,
-        esp_alloc::ExternalMemory,
-    );
-    let mut http_buf = alloc::boxed::Box::<[u8], _>::new_uninit_slice_in(
-        HTTP_BUF_LEN,
-        esp_alloc::ExternalMemory,
-    );
+    let mut tls_read =
+        alloc::boxed::Box::<[u8], _>::new_uninit_slice_in(TLS_BUF_LEN, esp_alloc::ExternalMemory);
+    let mut tls_write =
+        alloc::boxed::Box::<[u8], _>::new_uninit_slice_in(TLS_BUF_LEN, esp_alloc::ExternalMemory);
+    let mut http_buf =
+        alloc::boxed::Box::<[u8], _>::new_uninit_slice_in(HTTP_BUF_LEN, esp_alloc::ExternalMemory);
     // SAFETY: u8 has no validity requirements; consumers overwrite before reading.
     let tls_read = unsafe { tls_read.assume_init_mut() };
     let tls_write = unsafe { tls_write.assume_init_mut() };
@@ -124,7 +118,11 @@ pub async fn run(
                     log::info!("ns_api: fetched {}/{} train infos", applied, batch.len());
                 }
                 Err(e) => {
-                    log::warn!("ns_api: fetch failed: {:?} (batch={:?})", e, batch.as_slice());
+                    log::warn!(
+                        "ns_api: fetch failed: {:?} (batch={:?})",
+                        e,
+                        batch.as_slice()
+                    );
                     Timer::after(FAILURE_BACKOFF).await;
                     break;
                 }
@@ -133,6 +131,7 @@ pub async fn run(
     }
 }
 
+#[allow(dead_code)]
 #[derive(Debug)]
 enum FetchError {
     Http(reqwless::Error),
@@ -171,21 +170,14 @@ where
         .await
         .map_err(FetchError::Http)?;
     let mut req = req.headers(&headers);
-    let resp = req
-        .send(http_buf)
-        .await
-        .map_err(FetchError::Http)?;
+    let resp = req.send(http_buf).await.map_err(FetchError::Http)?;
 
     let status = resp.status;
     if !status.is_successful() {
         return Err(FetchError::HttpStatus(status.0));
     }
 
-    let body = resp
-        .body()
-        .read_to_end()
-        .await
-        .map_err(FetchError::Http)?;
+    let body = resp.body().read_to_end().await.map_err(FetchError::Http)?;
     let body_str = core::str::from_utf8(body).map_err(|_| FetchError::InvalidUtf8)?;
 
     // Response is a JSON array of TrainInfo objects.

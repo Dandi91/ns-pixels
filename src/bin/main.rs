@@ -10,7 +10,6 @@ use embassy_net::{
     dns::DnsQueryType,
     dns::DnsSocket,
     tcp::TcpSocket,
-    tcp::client::{TcpClient, TcpClientState},
 };
 use embassy_time::{Duration, Instant, Timer};
 use esp_alloc as _;
