@@ -227,29 +227,89 @@ async fn hub75_task(
     }
 }
 
-/// Plot every train in the registry as one pixel coloured by [`TrainType`].
-/// Holds the registry mutex only for the duration of the iteration.
+/// Per-train dwell on its color before the cross-fade into the next cluster
+/// member begins. Total cycle length for a cluster of N is `N * SLOT_MS`.
+const SLOT_MS: u64 = 1500;
+/// Tail end of each slot spent fading into the next color.
+const FADE_MS: u64 = 500;
+
+/// Plot every train in the registry. When multiple trains share a pixel,
+/// cycle through their colors over time with a gradual cross-fade.
+/// Holds the registry mutex only for the collection step.
 async fn draw_trains(fb: &mut FBType, registry: &SharedRegistry) {
     use embedded_graphics::prelude::Point;
-    let reg = registry.lock().await;
-    for (_, state) in reg.iter() {
-        if !state.pixel.is_on_screen() {
-            continue;
+
+    // (packed x<<8 | y, type) — small enough to copy out under the lock so
+    // we can release it before sorting / grouping / rendering.
+    let mut entries: heapless::Vec<(u16, TrainType), { crate::registry::MAX_TRAINS }> =
+        heapless::Vec::new();
+    {
+        let reg = registry.lock().await;
+        for (_, state) in reg.iter() {
+            if !state.pixel.is_on_screen() {
+                continue;
+            }
+            let key = ((state.pixel.x as u16) << 8) | state.pixel.y as u16;
+            let _ = entries.push((key, state.typ));
         }
-        let p = Point::new(state.pixel.x as i32, state.pixel.y as i32);
-        fb.set_pixel(p, color_for(state.typ));
+    }
+    entries.sort_unstable_by_key(|e| e.0);
+
+    let now_ms = Instant::now().as_millis();
+
+    let mut i = 0;
+    while i < entries.len() {
+        let key = entries[i].0;
+        let mut j = i + 1;
+        while j < entries.len() && entries[j].0 == key {
+            j += 1;
+        }
+        let rgb = cluster_color(&entries[i..j], now_ms);
+        let p = Point::new((key >> 8) as i32, (key & 0xff) as i32);
+        fb.set_pixel(p, Color::new(rgb[0], rgb[1], rgb[2]));
+        i = j;
     }
 }
 
-fn color_for(typ: TrainType) -> Color {
+/// Pick the cluster's current color. Single-train clusters render flat;
+/// larger clusters cycle through members, holding each for `SLOT_MS - FADE_MS`
+/// then linearly cross-fading into the next over `FADE_MS`.
+fn cluster_color(cluster: &[(u16, TrainType)], now_ms: u64) -> [u8; 3] {
+    if cluster.len() == 1 {
+        return color_for(cluster[0].1);
+    }
+    let n = cluster.len() as u64;
+    let phase = now_ms % (n * SLOT_MS);
+    let slot = (phase / SLOT_MS) as usize;
+    let in_slot = phase % SLOT_MS;
+    let a = color_for(cluster[slot].1);
+    if in_slot + FADE_MS <= SLOT_MS {
+        a
+    } else {
+        let b = color_for(cluster[(slot + 1) % cluster.len()].1);
+        let t = ((in_slot + FADE_MS - SLOT_MS) * 255 / FADE_MS) as u8;
+        blend(a, b, t)
+    }
+}
+
+fn blend(a: [u8; 3], b: [u8; 3], t: u8) -> [u8; 3] {
+    let lerp = |x: u8, y: u8| -> u8 {
+        let inv = 255 - t as u16;
+        let v = x as u16 * inv + y as u16 * t as u16;
+        (v / 255) as u8
+    };
+    [lerp(a[0], b[0]), lerp(a[1], b[1]), lerp(a[2], b[2])]
+}
+
+fn color_for(typ: TrainType) -> [u8; 3] {
     match typ {
-        TrainType::SNG => Color::new(255, 80, 0),    // orange
-        TrainType::SLT => Color::new(0, 200, 255),   // cyan
-        TrainType::Flirt => Color::new(255, 0, 200), // magenta
-        TrainType::ICM => Color::new(255, 220, 0),   // yellow
-        TrainType::DDZ => Color::new(0, 255, 80),    // green
-        TrainType::VIRM => Color::new(80, 80, 255),  // blue
-        TrainType::ICNG => Color::new(255, 255, 255),
-        TrainType::Unknown => Color::new(40, 40, 40), // dim grey
+        TrainType::SNG => [255, 80, 0],    // orange
+        TrainType::SLT => [0, 200, 255],   // cyan
+        TrainType::Flirt => [255, 0, 200], // magenta
+        TrainType::ICM => [255, 220, 0],   // yellow
+        TrainType::DDZ => [0, 255, 80],    // green
+        TrainType::VIRM => [80, 80, 255],  // blue
+        TrainType::ICNG => [255, 255, 255],
+        TrainType::Unknown => [40, 40, 40], // dim gray
     }
 }
