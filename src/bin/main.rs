@@ -10,13 +10,13 @@ use embassy_time::{Duration, Timer};
 use esp_alloc as _;
 use esp_backtrace as _;
 use esp_hal::{
-    clock::CpuClock, interrupt::software::SoftwareInterruptControl, ram, rng::Rng,
+    clock::CpuClock, gpio::Pin, interrupt::software::SoftwareInterruptControl, ram, rng::Rng,
     timer::timg::TimerGroup,
 };
-use esp_hub75::Hub75Pins16;
 use esp_println::println;
 use esp_radio::wifi::{Config, ControllerConfig, Interface, WifiController, sta::StationConfig};
 use ns_pixels::{
+    display::{self, DisplayPeripherals},
     feed,
     ns_api::{self, NewTrainQueue},
     registry::{Registry, SharedRegistry},
@@ -53,6 +53,33 @@ async fn main(spawner: Spawner) -> ! {
     let timg0 = TimerGroup::new(peripherals.TIMG0);
     let sw_int = SoftwareInterruptControl::new(peripherals.SW_INTERRUPT);
     esp_rtos::start(timg0.timer0, sw_int.software_interrupt0);
+
+    // Bring up the LED matrix on the second core. Pin assignments mirror the
+    // esp-hub75 lcd_cam_bp example; adjust if the board's wiring differs.
+    let display_peripherals = DisplayPeripherals {
+        lcd_cam: peripherals.LCD_CAM,
+        dma_channel: peripherals.DMA_CH0,
+        red1: peripherals.GPIO38.degrade(),
+        grn1: peripherals.GPIO42.degrade(),
+        blu1: peripherals.GPIO48.degrade(),
+        red2: peripherals.GPIO47.degrade(),
+        grn2: peripherals.GPIO2.degrade(),
+        blu2: peripherals.GPIO21.degrade(),
+        addr0: peripherals.GPIO14.degrade(),
+        addr1: peripherals.GPIO46.degrade(),
+        addr2: peripherals.GPIO13.degrade(),
+        addr3: peripherals.GPIO9.degrade(),
+        addr4: peripherals.GPIO3.degrade(),
+        blank: peripherals.GPIO11.degrade(),
+        clock: peripherals.GPIO12.degrade(),
+        latch: peripherals.GPIO10.degrade(),
+    };
+    display::start(
+        display_peripherals,
+        peripherals.CPU_CTRL,
+        sw_int.software_interrupt1,
+        sw_int.software_interrupt2,
+    );
 
     let station_config = Config::Station(
         StationConfig::default()

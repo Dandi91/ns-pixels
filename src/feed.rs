@@ -18,7 +18,7 @@ use crate::ns_api::NewTrainQueue;
 use crate::projection::wgs84_to_matrix;
 use crate::registry::SharedRegistry;
 use crate::xml_parser::{self, Train};
-use crate::zmq;
+use crate::{leak_psram_slice, zmq};
 
 const HOST: &str = "pubsub.besteffort.ndovloket.nl";
 const PORT: u16 = 7664;
@@ -135,14 +135,4 @@ pub async fn run(
             dropped,
         );
     }
-}
-
-/// Allocate `len` zeroed bytes in PSRAM and leak the box for a `&'static`
-/// borrow. Used for one-shot setup buffers; the task runs forever so we never
-/// reclaim them.
-fn leak_psram_slice(len: usize) -> &'static mut [u8] {
-    let b = alloc::boxed::Box::<[u8], _>::new_uninit_slice_in(len, esp_alloc::ExternalMemory);
-    // SAFETY: u8 has no validity invariants; smoltcp/zmq write before reading.
-    let b = unsafe { b.assume_init() };
-    alloc::boxed::Box::leak(b)
 }

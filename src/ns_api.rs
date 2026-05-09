@@ -20,6 +20,7 @@ use reqwless::{
 };
 use serde::Deserialize;
 
+use crate::leak_psram_slice;
 use crate::registry::SharedRegistry;
 use crate::train::TrainType;
 
@@ -66,16 +67,9 @@ pub async fn run(
     log::info!("ns_api enrichment task started");
 
     // PSRAM-backed scratch space — TLS bufs are too large for internal SRAM.
-    let mut tls_read =
-        alloc::boxed::Box::<[u8], _>::new_uninit_slice_in(TLS_BUF_LEN, esp_alloc::ExternalMemory);
-    let mut tls_write =
-        alloc::boxed::Box::<[u8], _>::new_uninit_slice_in(TLS_BUF_LEN, esp_alloc::ExternalMemory);
-    let mut http_buf =
-        alloc::boxed::Box::<[u8], _>::new_uninit_slice_in(HTTP_BUF_LEN, esp_alloc::ExternalMemory);
-    // SAFETY: u8 has no validity requirements; consumers overwrite before reading.
-    let tls_read = unsafe { tls_read.assume_init_mut() };
-    let tls_write = unsafe { tls_write.assume_init_mut() };
-    let http_buf = unsafe { http_buf.assume_init_mut() };
+    let tls_read = leak_psram_slice(TLS_BUF_LEN);
+    let tls_write = leak_psram_slice(TLS_BUF_LEN);
+    let http_buf = leak_psram_slice(HTTP_BUF_LEN);
 
     let tcp_state: TcpClientState<1, 4096, 4096> = TcpClientState::new();
     let tcp_client = TcpClient::new(stack, &tcp_state);
@@ -150,8 +144,8 @@ where
     T: embedded_nal_async::TcpConnect + 'a,
     D: embedded_nal_async::Dns + 'a,
 {
-    // Build URL: https://<host>/virtual-train-api/v1/trein/<comma-separated-ids>
-    // Max length: scheme+host (~50) + base (28) + BATCH_MAX*7 + 9 commas ≈ 160.
+    // Build URL: https://<host>/virtual-train-api/v1/trein?ids=<comma-separated-ids>
+    // Max length: scheme+host (~50) + base (32) + BATCH_MAX*7 + 9 commas ≈ 160.
     let mut url: String<256> = String::new();
     let _ = write!(url, "https://{HOST}/virtual-train-api/v1/trein?ids=");
     for (i, id) in batch.iter().enumerate() {
