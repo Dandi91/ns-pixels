@@ -51,7 +51,7 @@ static_cell      = "2.1.1"
 reqwless = { version = "0.14.0", default-features = false }
 miniz_oxide = { version = "0.9.1", default-features = false, features = ["with-alloc"] }
 esp-hub75 = { version = "0.11.0", features = ["esp32s3", "iram"] }
-quick-xml = { version = "0.39.4", default-features = false }
+xmlparser = { version = "0.13.6", default-features = false }
 
 
 # For fine tuning these settings, please refer to https://doc.rust-lang.org/cargo/reference/profiles.html

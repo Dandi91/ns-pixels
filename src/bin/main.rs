@@ -35,14 +35,13 @@ use reqwless::{
     client::HttpClient,
     request::{Method, RequestBuilder},
 };
-use miniz_oxide::{
-    DataFormat,
-    MZFlush,
-    MZStatus,
-    inflate::stream::{InflateState, inflate},
-};
 use esp_hub75::Hub75Pins16;
-use ns_pixels::{gzip, train_xml, zmq};
+use ns_pixels::{
+    decompress::Decompressor,
+    projection::{PixelCoord, wgs84_to_matrix},
+    xml_parser::{self, Train},
+    zmq,
+};
 
 esp_bootloader_esp_idf::esp_app_desc!();
 
@@ -126,15 +125,20 @@ async fn main(spawner: Spawner) -> ! {
     let mut sub = zmq::Subscriber::new(socket, 64 * 1024).await.unwrap();
     sub.subscribe(b"/RIG/NStreinpositiesInterface5").await.unwrap();
 
-    // ~43 KiB. Allocate in PSRAM (slower, but messages arrive every few
-    // seconds so we don't care). Using the ExternalMemory allocator forces
-    // the box to land in PSRAM rather than internal SRAM.
-    let mut inflate_state = alloc::boxed::Box::<InflateState, _>::new_in(
-        InflateState::new(DataFormat::Raw),
-        esp_alloc::ExternalMemory,
+    // Decompressor owns the InflateState (~43 KiB) and a 400 KiB output buffer, both in PSRAM.
+    // Typical decompressed XML is ~300 KiB; 400 KiB gives headroom for busy moments.
+    let mut decompressor = Decompressor::new(400 * 1024);
+    println!(
+        "decompressor allocated in PSRAM ({} KiB buffer)",
+        decompressor.capacity() / 1024
     );
-    println!("inflate state allocated in PSRAM");
-    let mut inflate_out = [0u8; 2048];
+
+    // Per-message scratch space, reused across iterations. Allocated in
+    // PSRAM since they can grow into the thousands of entries.
+    let mut trains: alloc::vec::Vec<Train, _> =
+        alloc::vec::Vec::new_in(esp_alloc::ExternalMemory);
+    let mut coords: alloc::vec::Vec<PixelCoord, _> =
+        alloc::vec::Vec::new_in(esp_alloc::ExternalMemory);
 
     loop {
         let frames = sub.recv().await.unwrap();
@@ -145,44 +149,32 @@ async fn main(spawner: Spawner) -> ! {
         let payload = &frames[1];
 
         let start = Instant::now();
-        let header_len = match gzip::skip_header(payload) {
-            Some(n) => n,
-            None => {
-                println!("bad gzip header");
+        let xml = match decompressor.inflate_gzip(payload) {
+            Ok(s) => s,
+            Err(e) => {
+                println!("decompress error: {:?}", e);
                 continue;
             }
         };
+        let inflate_ms = start.elapsed().as_millis();
+        let xml_kib = xml.len() / 1024;
 
-        inflate_state.reset(DataFormat::Raw);
-        let mut parser = train_xml::Parser::new();
-        let mut count = 0u32;
-        let mut input = &payload[header_len..];
+        trains.clear();
+        xml_parser::parse(xml, |t| trains.push(t));
+        let parse_ms = start.elapsed().as_millis() - inflate_ms;
 
-        loop {
-            let last = input.is_empty();
-            let flush = if last { MZFlush::Finish } else { MZFlush::None };
-            let res = inflate(&mut *inflate_state, input, &mut inflate_out, flush);
-            input = &input[res.bytes_consumed..];
-            if res.bytes_written > 0 {
-                parser.feed(&inflate_out[..res.bytes_written], |t| {
-                    count += 1;
-                    // log::info!("train {} @ ({:.6}, {:.6})", t.nummer, t.lat, t.lon);
-                });
-            }
-            match res.status {
-                Ok(MZStatus::StreamEnd) => break,
-                Ok(_) => {
-                    if res.bytes_written == 0 && res.bytes_consumed == 0 {
-                        break;
-                    }
-                }
-                Err(e) => {
-                    println!("inflate error: {:?}", e);
-                    break;
-                }
-            }
-        }
-        println!("decoded {} trains in {} ms", count, start.elapsed().as_millis());
+        coords.clear();
+        coords.extend(trains.iter().map(|t| wgs84_to_matrix(t.lat, t.lon)));
+        let total_ms = start.elapsed().as_millis();
+
+        println!(
+            "{} KiB XML, {} trains: inflate {} ms, parse {} ms, total {} ms",
+            xml_kib,
+            trains.len(),
+            inflate_ms,
+            parse_ms,
+            total_ms,
+        );
     }
 }
 
