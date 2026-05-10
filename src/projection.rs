@@ -9,12 +9,16 @@ pub struct PixelCoord {
 
 impl PixelCoord {
     pub fn is_on_screen(&self) -> bool {
-        (self.x as usize) < WIDTH && (self.y as usize) < HEIGHT
+        self.x < WIDTH && self.y < HEIGHT
+    }
+
+    pub fn as_u16(&self) -> u16 {
+        ((self.x as u16) << 8) | self.y as u16
     }
 }
 
-pub const WIDTH: usize = 64;
-pub const HEIGHT: usize = 64;
+pub const WIDTH: u8 = 64;
+pub const HEIGHT: u8 = 64;
 
 // RD bounding box covering the Netherlands; matches the Python reference.
 const X_MIN: f32 = 0.0;

@@ -30,7 +30,7 @@ use esp_println::println;
 use esp_rtos::embassy::{Executor, InterruptExecutor};
 
 use crate::registry::SharedRegistry;
-use crate::train::TrainType;
+use crate::train::{TrainProperties, TrainType};
 
 pub const ROWS: usize = 64;
 pub const COLS: usize = 64;
@@ -239,54 +239,41 @@ const FADE_MS: u64 = 500;
 async fn draw_trains(fb: &mut FBType, registry: &SharedRegistry) {
     use embedded_graphics::prelude::Point;
 
-    // (packed x<<8 | y, type) — small enough to copy out under the lock so
-    // we can release it before sorting / grouping / rendering.
-    let mut entries: heapless::Vec<(u16, TrainType), { crate::registry::MAX_TRAINS }> =
-        heapless::Vec::new();
     {
         let reg = registry.lock().await;
-        for (_, state) in reg.iter() {
-            if !state.pixel.is_on_screen() {
-                continue;
+        let now_ms = Instant::now().as_millis();
+        let mut i = 0;
+        let entries = reg.get_clusterized();
+        while i < entries.len() {
+            let key = entries[i].coord_key;
+            let mut j = i + 1;
+            while j < entries.len() && entries[j].coord_key == key {
+                j += 1;
             }
-            let key = ((state.pixel.x as u16) << 8) | state.pixel.y as u16;
-            let _ = entries.push((key, state.typ));
+            let rgb = cluster_color(&entries[i..j], now_ms);
+            let p = Point::new((key >> 8) as i32, (key & 0xff) as i32);
+            fb.set_pixel(p, Color::new(rgb[0], rgb[1], rgb[2]));
+            i = j;
         }
-    }
-    entries.sort_unstable_by_key(|e| e.0);
-
-    let now_ms = Instant::now().as_millis();
-
-    let mut i = 0;
-    while i < entries.len() {
-        let key = entries[i].0;
-        let mut j = i + 1;
-        while j < entries.len() && entries[j].0 == key {
-            j += 1;
-        }
-        let rgb = cluster_color(&entries[i..j], now_ms);
-        let p = Point::new((key >> 8) as i32, (key & 0xff) as i32);
-        fb.set_pixel(p, Color::new(rgb[0], rgb[1], rgb[2]));
-        i = j;
     }
 }
 
 /// Pick the cluster's current color. Single-train clusters render flat;
 /// larger clusters cycle through members, holding each for `SLOT_MS - FADE_MS`
 /// then linearly cross-fading into the next over `FADE_MS`.
-fn cluster_color(cluster: &[(u16, TrainType)], now_ms: u64) -> [u8; 3] {
+fn cluster_color(cluster: &[TrainProperties], now_ms: u64) -> [u8; 3] {
     if cluster.len() == 1 {
-        return color_for(cluster[0].1);
+        return color_for(cluster[0].typ);
     }
     let n = cluster.len() as u64;
     let phase = now_ms % (n * SLOT_MS);
     let slot = (phase / SLOT_MS) as usize;
     let in_slot = phase % SLOT_MS;
-    let a = color_for(cluster[slot].1);
+    let a = color_for(cluster[slot].typ);
     if in_slot + FADE_MS <= SLOT_MS {
         a
     } else {
-        let b = color_for(cluster[(slot + 1) % cluster.len()].1);
+        let b = color_for(cluster[(slot + 1) % cluster.len()].typ);
         let t = ((in_slot + FADE_MS - SLOT_MS) * 255 / FADE_MS) as u8;
         blend(a, b, t)
     }

@@ -111,6 +111,7 @@ pub async fn run(
                     }
                 }
             }
+            reg.rebuild_clusters();
             registry_len = reg.len();
             unknowns = reg.unknown_count();
         }

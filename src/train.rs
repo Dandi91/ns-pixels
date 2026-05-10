@@ -2,7 +2,7 @@ use embassy_time::Instant;
 
 use crate::projection::PixelCoord;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum TrainType {
     Unknown,
     SNG,
@@ -14,7 +14,7 @@ pub enum TrainType {
     ICNG,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ServiceType {
     Unknown,
     Sprinter,
@@ -23,7 +23,7 @@ pub enum ServiceType {
 }
 
 /// One row of the live registry. Identified externally by train number.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug)]
 pub struct TrainState {
     pub pixel: PixelCoord,
     pub last_seen: Instant,
@@ -38,6 +38,22 @@ impl TrainState {
             last_seen,
             typ: TrainType::Unknown,
             service: ServiceType::Unknown,
+        }
+    }
+}
+
+pub struct TrainProperties {
+    pub coord_key: u16,
+    pub typ: TrainType,
+    pub service: ServiceType,
+}
+
+impl From<&TrainState> for TrainProperties {
+    fn from(state: &TrainState) -> Self {
+        Self {
+            coord_key: state.pixel.as_u16(),
+            typ: state.typ,
+            service: state.service,
         }
     }
 }
