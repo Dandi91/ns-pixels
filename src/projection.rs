@@ -22,7 +22,7 @@ pub const HEIGHT: u8 = 64;
 
 // RD bounding box covering the Netherlands; matches the Python reference.
 const X_MIN: f32 = 0.0;
-const Y_MIN: f32 = 305_000.0;
+const Y_MIN: f32 = 307_500.0;
 const M_PER_PIXEL: f32 = 4_375.0; // 280 km / 64 px
 
 /// Project a WGS-84 (lat, lon) pair onto the 64×64 LED matrix.

@@ -25,7 +25,7 @@ const PORT: u16 = 7664;
 const TOPIC: &[u8] = b"/RIG/NStreinpositiesInterface5";
 
 /// Trains not seen in this many seconds are dropped from the registry.
-const STALE_AFTER: Duration = Duration::from_secs(60);
+const STALE_AFTER: Duration = Duration::from_secs(60 * 5);
 
 /// PSRAM scratch sizes.
 const TCP_RX_LEN: usize = 4096;

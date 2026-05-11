@@ -183,7 +183,7 @@ async fn hub75_task(
         owned.pins,
         owned.dma_channel,
         descriptors,
-        Rate::from_mhz(16),
+        Rate::from_mhz(20),
     )
     .expect("failed to create Hub75!");
 
