@@ -29,8 +29,9 @@ use esp_hub75::{
 use esp_println::println;
 use esp_rtos::embassy::{Executor, InterruptExecutor};
 
-use crate::registry::SharedRegistry;
+use crate::registry::MAX_TRAINS;
 use crate::train::{PixelData, TrainType};
+use heapless::Vec;
 
 pub const ROWS: usize = 64;
 pub const COLS: usize = 64;
@@ -86,7 +87,6 @@ macro_rules! mk_static {
 /// second core has been started.
 pub fn start(
     peripherals: DisplayPeripherals<'static>,
-    registry: &'static SharedRegistry,
     cpu_ctrl: CPU_CTRL<'static>,
     sw_int_core: SoftwareInterrupt<'static, 1>,
     sw_int_hp: SoftwareInterrupt<'static, 2>,
@@ -95,6 +95,10 @@ pub fn start(
     fb0.erase();
     let fb1 = mk_static!(FBType, FBType::new());
     fb1.erase();
+
+    let clusters0 = mk_static!(ClusterVec, ClusterVec::new());
+    let clusters1 = mk_static!(ClusterVec, ClusterVec::new());
+    FREE_CLUSTERS.signal(clusters1);
 
     static TX: FrameBufferExchange = FrameBufferExchange::new();
     static RX: FrameBufferExchange = FrameBufferExchange::new();
@@ -129,7 +133,7 @@ pub fn start(
 
         let lp_executor = mk_static!(Executor, Executor::new());
         lp_executor.run(|spawner: Spawner| {
-            spawner.spawn(display_task(registry, &TX, &RX, fb0).unwrap());
+            spawner.spawn(display_task(&TX, &RX, fb0, clusters0).unwrap());
         });
     };
 
@@ -138,18 +142,22 @@ pub fn start(
 
 #[embassy_executor::task]
 async fn display_task(
-    registry: &'static SharedRegistry,
     rx: &'static FrameBufferExchange,
     tx: &'static FrameBufferExchange,
     mut fb: &'static mut FBType,
+    mut clusters: &'static mut ClusterVec,
 ) {
     println!("display_task: starting!");
     let mut count = 0u32;
     let mut start = Instant::now();
 
     loop {
+        if let Some(new) = FRESH_CLUSTERS.try_take() {
+            let old = core::mem::replace(&mut clusters, new);
+            FREE_CLUSTERS.signal(old);
+        }
         fb.erase();
-        draw_trains(fb, registry).await;
+        draw_trains(fb, clusters);
 
         tx.signal(fb);
         fb = rx.wait().await;
@@ -191,8 +199,8 @@ async fn hub75_task(
     let mut start = Instant::now();
     let mut fb = fb;
 
-    // Hand off our initial buffer for the first render and take the renderer's
-    // buffer as our first DMA source.
+    // Hand off our initial buffer for the first render and
+    // take the renderer's buffer as our first DMA source.
     let new_fb = rx.wait().await;
     tx.signal(fb);
     fb = new_fb;
@@ -265,6 +273,29 @@ pub fn set_viz_mode(mode: VizMode) {
     VIZ_MODE.store(mode as u8, Ordering::Relaxed);
 }
 
+/// The display-side cluster snapshot. Producers (feed / ns_api) rebuild into
+/// a free buffer and publish it; the display task drains the latest one each
+/// frame. Sized for the worst case of one entry per train in the registry.
+pub type ClusterVec = Vec<PixelData, MAX_TRAINS>;
+
+/// Buffers the producer has filled and is asking the display to start using.
+static FRESH_CLUSTERS: Signal<CriticalSectionRawMutex, &'static mut ClusterVec> = Signal::new();
+/// Buffers the display is done with and the producer can reuse.
+static FREE_CLUSTERS: Signal<CriticalSectionRawMutex, &'static mut ClusterVec> = Signal::new();
+
+/// Producer-side: claim a free buffer to rebuild into. Returns `None` if the
+/// display hasn't recycled the previous snapshot yet — in that case, skip
+/// publishing this round; the next update will catch up.
+pub fn try_take_free_clusters() -> Option<&'static mut ClusterVec> {
+    FREE_CLUSTERS.try_take()
+}
+
+/// Producer-side: hand a freshly-rebuilt snapshot to the display. Pairs with
+/// [`try_take_free_clusters`].
+pub fn publish_clusters(v: &'static mut ClusterVec) {
+    FRESH_CLUSTERS.signal(v);
+}
+
 /// Dwell time on a single highlighted type before the cross-fade into the
 /// next type begins. Total cycle length is `ACTIVE_TYPES.len() * SLOT_MS`.
 const SLOT_MS: u64 = 1500;
@@ -286,15 +317,13 @@ const ACTIVE_TYPES: [u8; 7] = [
     TrainType::ICNG_BIT,
 ];
 
-/// Plot every train in the registry, pulsing the whole map through the type
-/// cycle: pixels that include the currently-active type render full bright;
-/// others render dim in their own type color.
-async fn draw_trains(fb: &mut FBType, registry: &SharedRegistry) {
-    let reg = registry.lock().await;
+/// Plot the current snapshot, dispatching on the active [`VizMode`]. The
+/// snapshot is the display's own buffer; no registry lock is taken here.
+fn draw_trains(fb: &mut FBType, clusters: &ClusterVec) {
     let now_ms = Instant::now().as_millis();
     match viz_mode() {
-        VizMode::PerCluster => draw_per_cluster(fb, reg.get_clusterized(), now_ms),
-        VizMode::GlobalPulse => draw_global_pulse(fb, reg.get_clusterized(), now_ms),
+        VizMode::PerCluster => draw_per_cluster(fb, clusters.as_slice(), now_ms),
+        VizMode::GlobalPulse => draw_global_pulse(fb, clusters.as_slice(), now_ms),
     }
 }
 

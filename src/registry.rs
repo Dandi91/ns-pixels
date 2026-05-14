@@ -20,7 +20,6 @@ const EVICT_BATCH: usize = 64;
 #[derive(Default)]
 pub struct Registry {
     map: FnvIndexMap<u32, TrainState, MAX_TRAINS>,
-    clusterized: Vec<PixelData, MAX_TRAINS>,
 }
 
 impl Registry {
@@ -34,10 +33,6 @@ impl Registry {
 
     pub fn is_empty(&self) -> bool {
         self.map.is_empty()
-    }
-
-    pub fn get_clusterized(&self) -> &[PixelData] {
-        &self.clusterized
     }
 
     /// Insert or refresh `number`. Returns `true` if the entry is new (caller
@@ -112,34 +107,37 @@ impl Registry {
         }
     }
 
-    pub fn rebuild_clusters(&mut self) {
-        self.clusterized.clear();
+    /// Rebuild the on-screen cluster snapshot into `out`, replacing its
+    /// contents. Walks every visible train, sorts by pixel coordinate, then
+    /// collapses adjacent same-pixel entries by OR-ing their type bitmasks.
+    /// Caller owns the buffer so the display task can read it without holding
+    /// the registry lock.
+    pub fn rebuild_clusters_into(&self, out: &mut Vec<PixelData, MAX_TRAINS>) {
+        out.clear();
         for state in self.map.values() {
             if !state.pixel.is_on_screen() {
                 continue;
             }
-            // SAFETY: there are at most MAX_TRAINS entries in the map, so all should fit
-            unsafe { self.clusterized.push_unchecked(state.into()) };
+            // SAFETY: at most MAX_TRAINS entries in the map, so all fit.
+            unsafe { out.push_unchecked(state.into()) };
         }
-        self.clusterized.sort_unstable_by_key(|e| e.coord_key);
-        // Collapse runs of entries sharing a pixel into a single entry by OR-ing their type bitmasks together.
-        // After sort, equal coord_keys are adjacent.
+        out.sort_unstable_by_key(|e| e.coord_key);
+        // Collapse runs of entries sharing a pixel by OR-ing their type
+        // bitmasks. After the sort, equal coord_keys are adjacent.
         let mut write = 0;
         let mut read = 0;
-        while read < self.clusterized.len() {
+        while read < out.len() {
             if write != read {
-                self.clusterized[write] = self.clusterized[read];
+                out[write] = out[read];
             }
             read += 1;
-            while read < self.clusterized.len()
-                && self.clusterized[read].coord_key == self.clusterized[write].coord_key
-            {
-                self.clusterized[write].types |= self.clusterized[read].types;
+            while read < out.len() && out[read].coord_key == out[write].coord_key {
+                out[write].types |= out[read].types;
                 read += 1;
             }
             write += 1;
         }
-        self.clusterized.truncate(write);
+        out.truncate(write);
     }
 }
 

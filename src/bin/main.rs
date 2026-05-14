@@ -84,7 +84,6 @@ async fn main(spawner: Spawner) -> ! {
 
     display::start(
         display_peripherals,
-        registry,
         peripherals.CPU_CTRL,
         sw_int.software_interrupt1,
         sw_int.software_interrupt2,

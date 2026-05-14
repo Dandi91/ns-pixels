@@ -20,6 +20,7 @@ use reqwless::{
 };
 use serde::Deserialize;
 
+use crate::display;
 use crate::leak_psram_slice;
 use crate::registry::SharedRegistry;
 use crate::train::TrainType;
@@ -129,9 +130,13 @@ pub async fn run(
                 }
             }
 
-            {
-                let mut reg = registry.lock().await;
-                reg.rebuild_clusters();
+            // Refresh the display snapshot if a buffer is available.
+            if let Some(buf) = display::try_take_free_clusters() {
+                {
+                    let reg = registry.lock().await;
+                    reg.rebuild_clusters_into(buf);
+                }
+                display::publish_clusters(buf);
             }
         }
     }

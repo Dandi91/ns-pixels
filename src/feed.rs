@@ -14,6 +14,7 @@ use embassy_time::{Duration, Instant};
 use esp_println::println;
 
 use crate::decompress::Decompressor;
+use crate::display;
 use crate::ns_api::NewTrainQueue;
 use crate::projection::wgs84_to_matrix;
 use crate::registry::SharedRegistry;
@@ -97,6 +98,9 @@ pub async fn run(
         let mut evicted = 0;
         let registry_len;
         let unknowns;
+        // Grab a free snapshot buffer before locking; if the display hasn't
+        // recycled the last one yet, we just skip publishing this round.
+        let mut snapshot = display::try_take_free_clusters();
         {
             let mut reg = registry.lock().await;
             if cutoff != now {
@@ -111,9 +115,14 @@ pub async fn run(
                     }
                 }
             }
-            reg.rebuild_clusters();
+            if let Some(buf) = snapshot.as_deref_mut() {
+                reg.rebuild_clusters_into(buf);
+            }
             registry_len = reg.len();
             unknowns = reg.unknown_count();
+        }
+        if let Some(buf) = snapshot {
+            display::publish_clusters(buf);
         }
         let total_ms = start.elapsed().as_millis();
 
