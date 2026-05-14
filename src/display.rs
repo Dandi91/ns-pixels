@@ -9,7 +9,7 @@
 //! The render task currently draws a placeholder gradient; the train registry
 //! is not wired in yet.
 
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicU8, AtomicU32, Ordering};
 
 use embassy_executor::Spawner;
 use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, signal::Signal};
@@ -30,7 +30,7 @@ use esp_println::println;
 use esp_rtos::embassy::{Executor, InterruptExecutor};
 
 use crate::registry::SharedRegistry;
-use crate::train::TrainType;
+use crate::train::{PixelData, TrainType};
 
 pub const ROWS: usize = 64;
 pub const COLS: usize = 64;
@@ -227,6 +227,44 @@ async fn hub75_task(
     }
 }
 
+/// Visualization modes the renderer can be in. The active mode is selected
+/// externally (button input) and read by [`draw_trains`] each frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum VizMode {
+    /// Each multi-type pixel cycles through its own member colors locally.
+    PerCluster = 0,
+    /// The whole map pulses through the global type cycle; pixels matching
+    /// the active type render bright, others dim in their own color.
+    GlobalPulse = 1,
+}
+
+impl VizMode {
+    fn from_u8(v: u8) -> Self {
+        match v {
+            1 => VizMode::GlobalPulse,
+            _ => VizMode::PerCluster,
+        }
+    }
+
+    pub fn next(self) -> Self {
+        match self {
+            VizMode::PerCluster => VizMode::GlobalPulse,
+            VizMode::GlobalPulse => VizMode::PerCluster,
+        }
+    }
+}
+
+static VIZ_MODE: AtomicU8 = AtomicU8::new(VizMode::PerCluster as u8);
+
+pub fn viz_mode() -> VizMode {
+    VizMode::from_u8(VIZ_MODE.load(Ordering::Relaxed))
+}
+
+pub fn set_viz_mode(mode: VizMode) {
+    VIZ_MODE.store(mode as u8, Ordering::Relaxed);
+}
+
 /// Dwell time on a single highlighted type before the cross-fade into the
 /// next type begins. Total cycle length is `ACTIVE_TYPES.len() * SLOT_MS`.
 const SLOT_MS: u64 = 1500;
@@ -252,10 +290,63 @@ const ACTIVE_TYPES: [u8; 7] = [
 /// cycle: pixels that include the currently-active type render full bright;
 /// others render dim in their own type color.
 async fn draw_trains(fb: &mut FBType, registry: &SharedRegistry) {
-    use embedded_graphics::prelude::Point;
-
     let reg = registry.lock().await;
     let now_ms = Instant::now().as_millis();
+    match viz_mode() {
+        VizMode::PerCluster => draw_per_cluster(fb, reg.get_clusterized(), now_ms),
+        VizMode::GlobalPulse => draw_global_pulse(fb, reg.get_clusterized(), now_ms),
+    }
+}
+
+/// Per-pixel cycle: each multi-type pixel independently rotates through its
+/// member colors with a brief cross-fade. Single-type pixels render flat.
+fn draw_per_cluster(fb: &mut FBType, pixels: &[PixelData], now_ms: u64) {
+    use embedded_graphics::prelude::Point;
+    for e in pixels {
+        let rgb = cluster_color(e.types, now_ms);
+        let p = Point::new((e.coord_key >> 8) as i32, (e.coord_key & 0xff) as i32);
+        fb.set_pixel(p, Color::new(rgb[0], rgb[1], rgb[2]));
+    }
+}
+
+/// Pick the cluster's current color from a bitmask of present types. Single
+/// type → flat; multiple bits → cycle through them, holding each for
+/// `SLOT_MS - FADE_MS` then linearly cross-fading into the next over `FADE_MS`.
+fn cluster_color(types: u8, now_ms: u64) -> [u8; 3] {
+    let n = types.count_ones() as u64;
+    match n {
+        0 => [0, 0, 0],
+        1 => color_for_bit(types),
+        _ => {
+            let phase = now_ms % (n * SLOT_MS);
+            let slot = (phase / SLOT_MS) as u32;
+            let in_slot = phase % SLOT_MS;
+            let a = color_for_bit(nth_set_bit(types, slot));
+            if in_slot + FADE_MS <= SLOT_MS {
+                a
+            } else {
+                let b = color_for_bit(nth_set_bit(types, (slot + 1) % n as u32));
+                let t = ((in_slot + FADE_MS - SLOT_MS) * 255 / FADE_MS) as u8;
+                blend(a, b, t)
+            }
+        }
+    }
+}
+
+/// Isolate the `n`-th (zero-indexed) set bit of `mask` as a single-bit `u8`.
+fn nth_set_bit(mask: u8, n: u32) -> u8 {
+    let mut m = mask;
+    for _ in 0..n {
+        m &= m - 1;
+    }
+    m & m.wrapping_neg()
+}
+
+/// Global pulse: the whole map highlights one type at a time. Pixels matching
+/// the active type render bright; others fall back to a dim color of their
+/// own lowest-set type bit.
+fn draw_global_pulse(fb: &mut FBType, pixels: &[PixelData], now_ms: u64) {
+    use embedded_graphics::prelude::Point;
     let n = ACTIVE_TYPES.len() as u64;
     let phase = now_ms % (n * SLOT_MS);
     let slot = (phase / SLOT_MS) as usize;
@@ -269,7 +360,7 @@ async fn draw_trains(fb: &mut FBType, registry: &SharedRegistry) {
         Some((active_b, t))
     };
 
-    for e in reg.get_clusterized() {
+    for e in pixels {
         let a = pixel_color(e.types, active_a);
         let rgb = match fade_t {
             None => a,

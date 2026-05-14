@@ -17,7 +17,7 @@ use esp_println::println;
 use esp_radio::wifi::{Config, ControllerConfig, Interface, WifiController, sta::StationConfig};
 use ns_pixels::{
     display::{self, DisplayPeripherals},
-    feed,
+    feed, input,
     ns_api::{self, NewTrainQueue},
     registry::{Registry, SharedRegistry},
 };
@@ -126,6 +126,7 @@ async fn main(spawner: Spawner) -> ! {
 
     spawner.spawn(feed::run(stack, registry, queue).unwrap());
     spawner.spawn(ns_api::run(stack, registry, queue, seed).unwrap());
+    spawner.spawn(input::run().unwrap());
 
     // Main has nothing more to do; tasks own the work loops.
     loop {
