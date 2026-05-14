@@ -30,7 +30,7 @@ use esp_println::println;
 use esp_rtos::embassy::{Executor, InterruptExecutor};
 
 use crate::registry::SharedRegistry;
-use crate::train::{TrainProperties, TrainType};
+use crate::train::TrainType;
 
 pub const ROWS: usize = 64;
 pub const COLS: usize = 64;
@@ -239,44 +239,46 @@ const FADE_MS: u64 = 500;
 async fn draw_trains(fb: &mut FBType, registry: &SharedRegistry) {
     use embedded_graphics::prelude::Point;
 
-    {
-        let reg = registry.lock().await;
-        let now_ms = Instant::now().as_millis();
-        let mut i = 0;
-        let entries = reg.get_clusterized();
-        while i < entries.len() {
-            let key = entries[i].coord_key;
-            let mut j = i + 1;
-            while j < entries.len() && entries[j].coord_key == key {
-                j += 1;
+    let reg = registry.lock().await;
+    let now_ms = Instant::now().as_millis();
+    for e in reg.get_clusterized() {
+        let rgb = cluster_color(e.types, now_ms);
+        let p = Point::new((e.coord_key >> 8) as i32, (e.coord_key & 0xff) as i32);
+        fb.set_pixel(p, Color::new(rgb[0], rgb[1], rgb[2]));
+    }
+}
+
+/// Pick the cluster's current color from a bitmask of present types. Single
+/// type → flat; multiple bits → cycle through them, holding each for
+/// `SLOT_MS - FADE_MS` then linearly cross-fading into the next over `FADE_MS`.
+fn cluster_color(types: u8, now_ms: u64) -> [u8; 3] {
+    let n = types.count_ones() as u64;
+    match n {
+        0 => [0, 0, 0],
+        1 => color_for_bit(types),
+        _ => {
+            let phase = now_ms % (n * SLOT_MS);
+            let slot = (phase / SLOT_MS) as u32;
+            let in_slot = phase % SLOT_MS;
+            let a = color_for_bit(nth_set_bit(types, slot));
+            if in_slot + FADE_MS <= SLOT_MS {
+                a
+            } else {
+                let b = color_for_bit(nth_set_bit(types, (slot + 1) % n as u32));
+                let t = ((in_slot + FADE_MS - SLOT_MS) * 255 / FADE_MS) as u8;
+                blend(a, b, t)
             }
-            let rgb = cluster_color(&entries[i..j], now_ms);
-            let p = Point::new((key >> 8) as i32, (key & 0xff) as i32);
-            fb.set_pixel(p, Color::new(rgb[0], rgb[1], rgb[2]));
-            i = j;
         }
     }
 }
 
-/// Pick the cluster's current color. Single-train clusters render flat;
-/// larger clusters cycle through members, holding each for `SLOT_MS - FADE_MS`
-/// then linearly cross-fading into the next over `FADE_MS`.
-fn cluster_color(cluster: &[TrainProperties], now_ms: u64) -> [u8; 3] {
-    if cluster.len() == 1 {
-        return color_for(cluster[0].typ);
+/// Isolate the `n`-th (zero-indexed) set bit of `mask` as a single-bit `u8`.
+fn nth_set_bit(mask: u8, n: u32) -> u8 {
+    let mut m = mask;
+    for _ in 0..n {
+        m &= m - 1;
     }
-    let n = cluster.len() as u64;
-    let phase = now_ms % (n * SLOT_MS);
-    let slot = (phase / SLOT_MS) as usize;
-    let in_slot = phase % SLOT_MS;
-    let a = color_for(cluster[slot].typ);
-    if in_slot + FADE_MS <= SLOT_MS {
-        a
-    } else {
-        let b = color_for(cluster[(slot + 1) % cluster.len()].typ);
-        let t = ((in_slot + FADE_MS - SLOT_MS) * 255 / FADE_MS) as u8;
-        blend(a, b, t)
-    }
+    m & m.wrapping_neg()
 }
 
 fn blend(a: [u8; 3], b: [u8; 3], t: u8) -> [u8; 3] {
@@ -288,15 +290,17 @@ fn blend(a: [u8; 3], b: [u8; 3], t: u8) -> [u8; 3] {
     [lerp(a[0], b[0]), lerp(a[1], b[1]), lerp(a[2], b[2])]
 }
 
-fn color_for(typ: TrainType) -> [u8; 3] {
-    match typ {
-        TrainType::SNG => [255, 80, 0],    // orange
-        TrainType::SLT => [0, 200, 255],   // cyan
-        TrainType::Flirt => [255, 0, 200], // magenta
-        TrainType::ICM => [255, 220, 0],   // yellow
-        TrainType::DDZ => [0, 255, 80],    // green
-        TrainType::VIRM => [80, 80, 255],  // blue
-        TrainType::ICNG => [255, 255, 255],
-        TrainType::Unknown => [10, 10, 10], // dim gray
+/// Map a single-bit `TrainType` mask to its display color.
+fn color_for_bit(bit: u8) -> [u8; 3] {
+    match bit {
+        TrainType::UNKNOWN_BIT => [10, 10, 10], // dim gray
+        TrainType::SNG_BIT => [255, 80, 0],     // orange
+        TrainType::SLT_BIT => [0, 200, 255],    // cyan
+        TrainType::FLIRT_BIT => [255, 0, 200],  // magenta
+        TrainType::ICM_BIT => [255, 220, 0],    // yellow
+        TrainType::DDZ_BIT => [0, 255, 80],     // green
+        TrainType::VIRM_BIT => [80, 80, 255],   // blue
+        TrainType::ICNG_BIT => [255, 255, 255],
+        _ => [0, 0, 0],
     }
 }

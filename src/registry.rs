@@ -9,7 +9,7 @@ use embassy_time::{Duration, Instant};
 use heapless::{FnvIndexMap, Vec};
 
 use crate::projection::PixelCoord;
-use crate::train::{TrainProperties, TrainState, TrainType};
+use crate::train::{PixelData, TrainState, TrainType};
 
 /// Must be a power of two. ~16 bytes/entry → 8 KiB at N=512.
 pub const MAX_TRAINS: usize = 512;
@@ -20,7 +20,7 @@ const EVICT_BATCH: usize = 64;
 #[derive(Default)]
 pub struct Registry {
     map: FnvIndexMap<u32, TrainState, MAX_TRAINS>,
-    clusterized: Vec<TrainProperties, MAX_TRAINS>,
+    clusterized: Vec<PixelData, MAX_TRAINS>,
 }
 
 impl Registry {
@@ -36,7 +36,7 @@ impl Registry {
         self.map.is_empty()
     }
 
-    pub fn get_clusterized(&self) -> &[TrainProperties] {
+    pub fn get_clusterized(&self) -> &[PixelData] {
         &self.clusterized
     }
 
@@ -122,6 +122,24 @@ impl Registry {
             unsafe { self.clusterized.push_unchecked(state.into()) };
         }
         self.clusterized.sort_unstable_by_key(|e| e.coord_key);
+        // Collapse runs of entries sharing a pixel into a single entry by OR-ing their type bitmasks together.
+        // After sort, equal coord_keys are adjacent.
+        let mut write = 0;
+        let mut read = 0;
+        while read < self.clusterized.len() {
+            if write != read {
+                self.clusterized[write] = self.clusterized[read];
+            }
+            read += 1;
+            while read < self.clusterized.len()
+                && self.clusterized[read].coord_key == self.clusterized[write].coord_key
+            {
+                self.clusterized[write].types |= self.clusterized[read].types;
+                read += 1;
+            }
+            write += 1;
+        }
+        self.clusterized.truncate(write);
     }
 }
 
