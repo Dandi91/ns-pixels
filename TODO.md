@@ -1,4 +1,3 @@
 - Update colors in realtime, don't wait for positions update
-- Bit pack colors into u8
 - Add second mode to display service type instead of train type
 - Display Randstad only
