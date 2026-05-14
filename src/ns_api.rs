@@ -12,7 +12,7 @@ use embassy_net::dns::DnsSocket;
 use embassy_net::tcp::client::{TcpClient, TcpClientState};
 use embassy_sync::blocking_mutex::raw::NoopRawMutex;
 use embassy_sync::channel::Channel;
-use embassy_time::{Duration, Timer};
+use embassy_time::{Duration, Instant, Timer};
 use heapless::{String, Vec};
 use reqwless::{
     client::{HttpClient, TlsConfig, TlsVerify},
@@ -35,6 +35,10 @@ const SWEEP_INTERVAL: Duration = Duration::from_secs(30);
 /// Pause between API calls if a previous call failed; avoids hammering the
 /// gateway when something is broken.
 const FAILURE_BACKOFF: Duration = Duration::from_secs(10);
+/// Minimum gap between enrichment attempts for the same train number. Trains
+/// whose info the API never returns (or returns in an unparseable form) sit on
+/// this cooldown instead of being re-requested every sweep.
+const RETRY_COOLDOWN: Duration = Duration::from_secs(60);
 
 const HOST: &str = "gateway.apiportal.ns.nl";
 const API_KEY: &str = env!("NS_API_KEY");
@@ -52,9 +56,12 @@ pub type NewTrainQueue = Channel<NoopRawMutex, u32, QUEUE_CAPACITY>;
 /// materieeldelen, …) that serde-json-core ignores by default.
 #[derive(Deserialize)]
 struct TrainInfo<'a> {
-    ritnummer: u32,
-    #[serde(rename = "type", borrow)]
-    typ: &'a str,
+    #[serde(rename = "ritnummer")]
+    number: u32,
+    #[serde(rename = "type", borrow, default)]
+    train_type: Option<&'a str>,
+    #[serde(rename = "bron", borrow)]
+    source: &'a str,
 }
 
 #[embassy_executor::task]
@@ -96,7 +103,7 @@ pub async fn run(
         loop {
             {
                 let reg = registry.lock().await;
-                reg.pending_enrichment(&mut batch);
+                reg.pending_enrichment(&mut batch, RETRY_COOLDOWN);
             }
             if batch.is_empty() {
                 break;
@@ -175,39 +182,52 @@ where
     let body_str = core::str::from_utf8(body).map_err(|_| FetchError::InvalidUtf8)?;
 
     // Response is a JSON array of TrainInfo objects.
-    let (parsed, _): (Vec<TrainInfo, BATCH_MAX>, usize) =
+    let (parsed, _): (Vec<TrainInfo, { BATCH_MAX * 5 }>, usize) =
         serde_json_core::from_str(body_str).map_err(|_| FetchError::Json)?;
 
+    let now = Instant::now();
     let mut applied = 0;
     {
         let mut reg = registry.lock().await;
         for info in &parsed {
-            reg.set_type(info.ritnummer, map_train_type(info.typ));
-            applied += 1;
+            let typ = if info.source == "DVS" {
+                map_train_type(info.train_type)
+            } else {
+                TrainType::Unknown
+            };
+            if typ != TrainType::Unknown {
+                applied += 1;
+            }
+            reg.set_type(info.number, typ, now);
         }
     }
     Ok(applied)
 }
 
-fn map_train_type(s: &str) -> TrainType {
-    // NS returns mixed-case strings like "Flirt", "VIRM-VI", "ICM-III".
-    // Strip subtype suffix and normalize to uppercase before matching.
-    let head = s.trim().split(['-', ' ']).next().unwrap_or(s);
-    let mut buf = [0u8; 16];
-    let n = head.len().min(buf.len());
-    buf[..n].copy_from_slice(&head.as_bytes()[..n]);
-    buf[..n].make_ascii_uppercase();
-    match &buf[..n] {
-        b"SNG" => TrainType::SNG,
-        b"SLT" => TrainType::SLT,
-        b"FLIRT" => TrainType::Flirt,
-        b"ICM" => TrainType::ICM,
-        b"DDZ" | b"DDAR" => TrainType::DDZ,
-        b"VIRM" => TrainType::VIRM,
-        b"ICNG" => TrainType::ICNG,
-        _ => {
-            log::info!("ns_api: unknown train type string {:?}", s);
-            TrainType::Unknown
+fn map_train_type(s: Option<&str>) -> TrainType {
+    match s {
+        None => TrainType::Unknown,
+        Some(s) => {
+            // NS returns mixed-case strings like "Flirt", "VIRM-VI", "ICM-III".
+            // Strip subtype suffix and normalize to uppercase before matching.
+            let head = s.trim().split(['-', ' ']).next().unwrap_or(s);
+            let mut buf = [0u8; 16];
+            let n = head.len().min(buf.len());
+            buf[..n].copy_from_slice(&head.as_bytes()[..n]);
+            buf[..n].make_ascii_uppercase();
+            match &buf[..n] {
+                b"SNG" => TrainType::SNG,
+                b"SLT" => TrainType::SLT,
+                b"FLIRT" => TrainType::Flirt,
+                b"ICM" => TrainType::ICM,
+                b"DDZ" | b"DDAR" => TrainType::DDZ,
+                b"VIRM" => TrainType::VIRM,
+                b"ICNG" => TrainType::ICNG,
+                _ => {
+                    log::info!("ns_api: unknown train type string {:?}", s);
+                    TrainType::Unknown
+                }
+            }
         }
     }
 }

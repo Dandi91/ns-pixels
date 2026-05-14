@@ -45,7 +45,7 @@ pub async fn run(
         let dns = DnsSocket::new(stack);
         dns.query(HOST, DnsQueryType::A).await.unwrap()[0]
     };
-    println!("feed: resolved {} → {}", HOST, peer_ip);
+    println!("feed: resolved {} -> {}", HOST, peer_ip);
 
     // TCP socket buffers — leaked into PSRAM via Box::leak so the resulting
     // &'static mut [u8] satisfies TcpSocket's borrow without a static_cell

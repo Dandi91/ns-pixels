@@ -297,6 +297,6 @@ fn color_for(typ: TrainType) -> [u8; 3] {
         TrainType::DDZ => [0, 255, 80],    // green
         TrainType::VIRM => [80, 80, 255],  // blue
         TrainType::ICNG => [255, 255, 255],
-        TrainType::Unknown => [40, 40, 40], // dim gray
+        TrainType::Unknown => [10, 10, 10], // dim gray
     }
 }

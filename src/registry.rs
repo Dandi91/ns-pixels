@@ -5,7 +5,7 @@
 
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::mutex::Mutex;
-use embassy_time::Instant;
+use embassy_time::{Duration, Instant};
 use heapless::{FnvIndexMap, Vec};
 
 use crate::projection::PixelCoord;
@@ -55,9 +55,13 @@ impl Registry {
         }
     }
 
-    pub fn set_type(&mut self, number: u32, typ: TrainType) {
+    /// Record an enrichment result for `number`. Always stamps
+    /// `last_enrichment_attempt` so unresolved trains (passed as
+    /// [`TrainType::Unknown`]) sit on the cooldown.
+    pub fn set_type(&mut self, number: u32, typ: TrainType, now: Instant) {
         if let Some(s) = self.map.get_mut(&number) {
             s.typ = typ;
+            s.last_enrichment = Some(now);
         }
     }
 
@@ -88,12 +92,21 @@ impl Registry {
     }
 
     /// Fill `buf` with up to `N` train numbers whose [`TrainType`] is
-    /// [`TrainType::Unknown`] — i.e. the work-list for the enrichment task.
-    /// Replaces any previous contents of `buf`.
-    pub fn pending_enrichment<const N: usize>(&self, buf: &mut Vec<u32, N>) {
+    /// [`TrainType::Unknown`] and that haven't been attempted within
+    /// `cooldown`. Replaces any previous contents of `buf`.
+    pub fn pending_enrichment<const N: usize>(&self, buf: &mut Vec<u32, N>, cooldown: Duration) {
         buf.clear();
+        let now = Instant::now();
         for (k, v) in self.map.iter() {
-            if v.typ == TrainType::Unknown && buf.push(*k).is_err() {
+            if v.typ != TrainType::Unknown {
+                continue;
+            }
+            if let Some(last) = v.last_enrichment {
+                if now.duration_since(last) < cooldown {
+                    continue;
+                }
+            }
+            if buf.push(*k).is_err() {
                 break;
             }
         }
@@ -106,7 +119,7 @@ impl Registry {
                 continue;
             }
             // SAFETY: there are at most MAX_TRAINS entries in the map, so all should fit
-            unsafe {self.clusterized.push_unchecked(state.into()) };
+            unsafe { self.clusterized.push_unchecked(state.into()) };
         }
         self.clusterized.sort_unstable_by_key(|e| e.coord_key);
     }

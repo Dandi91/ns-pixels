@@ -29,6 +29,7 @@ pub struct TrainState {
     pub last_seen: Instant,
     pub typ: TrainType,
     pub service: ServiceType,
+    pub last_enrichment: Option<Instant>,
 }
 
 impl TrainState {
@@ -38,6 +39,7 @@ impl TrainState {
             last_seen,
             typ: TrainType::Unknown,
             service: ServiceType::Unknown,
+            last_enrichment: None,
         }
     }
 }
