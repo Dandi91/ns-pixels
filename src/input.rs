@@ -1,26 +1,43 @@
 //! Button input task.
 //!
-//! Currently mocked: a single Embassy task that cycles [`VizMode`] on a fixed
-//! interval so the rest of the pipeline can be exercised without hardware.
-//! Replace [`run`]'s body with real GPIO polling / interrupt handling once
-//! the button pins are wired in.
+//! Two momentary buttons (UP / DOWN) are wired to GPIO pins, normally open and
+//! shorting to GND when pressed. Internal pull-ups hold the pin high at rest.
+//! UP cycles through the available [`VizMode`]s; DOWN is reserved for future
+//! use and currently only logs.
 
+use embassy_futures::select::{Either, select};
 use embassy_time::{Duration, Timer};
+use esp_hal::gpio::Input;
 use esp_println::println;
 
 use crate::display::{set_viz_mode, viz_mode};
 
-/// How often the mock "button" fires. Real hardware will replace this with
-/// a debounced interrupt.
-const MOCK_CYCLE: Duration = Duration::from_secs(60);
+/// Settling time after an edge before re-sampling. Cheap mechanical buttons
+/// bounce for a few ms; 30 ms is comfortably past that without feeling laggy.
+const DEBOUNCE: Duration = Duration::from_millis(30);
 
 #[embassy_executor::task]
-pub async fn run() {
-    println!("input: mock button task started");
+pub async fn run(mut up: Input<'static>, mut down: Input<'static>) {
+    println!("input: button task started");
     loop {
-        Timer::after(MOCK_CYCLE).await;
-        let next = viz_mode().next();
-        set_viz_mode(next);
-        println!("input: viz mode -> {:?}", next);
+        // Wait for whichever button fires first.
+        let edge = select(up.wait_for_falling_edge(), down.wait_for_falling_edge()).await;
+
+        // Debounce and confirm the pin is still pulled low — discards bounces
+        // and stray edges.
+        Timer::after(DEBOUNCE).await;
+        match edge {
+            Either::First(_) if up.is_low() => {
+                let next = viz_mode().next();
+                set_viz_mode(next);
+                println!("input: UP -> {:?}", next);
+                up.wait_for_high().await;
+            }
+            Either::Second(_) if down.is_low() => {
+                println!("input: DOWN (unbound)");
+                down.wait_for_high().await;
+            }
+            _ => {}
+        }
     }
 }

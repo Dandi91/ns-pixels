@@ -10,7 +10,11 @@ use embassy_time::{Duration, Timer};
 use esp_alloc as _;
 use esp_backtrace as _;
 use esp_hal::{
-    clock::CpuClock, gpio::Pin, interrupt::software::SoftwareInterruptControl, ram, rng::Rng,
+    clock::CpuClock,
+    gpio::{Input, InputConfig, Pin, Pull},
+    interrupt::software::SoftwareInterruptControl,
+    ram,
+    rng::Rng,
     timer::timg::TimerGroup,
 };
 use esp_println::println;
@@ -126,7 +130,12 @@ async fn main(spawner: Spawner) -> ! {
 
     spawner.spawn(feed::run(stack, registry, queue).unwrap());
     spawner.spawn(ns_api::run(stack, registry, queue, seed).unwrap());
-    spawner.spawn(input::run().unwrap());
+
+    // Buttons are NO to GND with internal pull-up — idle high, pressed low.
+    let btn_cfg = InputConfig::default().with_pull(Pull::Up);
+    let btn_up = Input::new(peripherals.GPIO6, btn_cfg);
+    let btn_down = Input::new(peripherals.GPIO7, btn_cfg);
+    spawner.spawn(input::run(btn_up, btn_down).unwrap());
 
     // Main has nothing more to do; tasks own the work loops.
     loop {
