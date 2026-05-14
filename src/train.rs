@@ -73,16 +73,20 @@ pub struct TrainState {
     pub last_seen: Instant,
     pub typ: TrainType,
     pub service: ServiceType,
-    /// Milliseconds between `last_seen` and the most recent enrichment
-    /// attempt, i.e. `last_seen - last_enrichment`. Sentinel
-    /// [`TrainState::ENRICHMENT_NEVER`] means no attempt has been made yet.
-    /// Trains live at most 5 minutes, so the value never exceeds 300 000.
-    pub last_enrichment_ago_ms: u32,
+    /// Seconds between `last_seen` and the most recent train-type enrichment
+    /// attempt, i.e. `last_seen - last_type_attempt`. Sentinel
+    /// [`TrainState::ATTEMPT_NEVER`] means no attempt has been made yet.
+    /// Trains live at most 5 minutes, so the value never exceeds 300.
+    pub last_type_attempt_ago_s: u16,
+    /// Same as [`last_type_attempt_ago_s`] but for the service-category
+    /// enrichment phase. Tracked separately so a successful type fetch
+    /// doesn't gate the immediately-following service fetch.
+    pub last_service_attempt_ago_s: u16,
 }
 
 impl TrainState {
-    /// Sentinel for `last_enrichment_ago_ms` meaning "no attempt yet".
-    pub const ENRICHMENT_NEVER: u32 = u32::MAX;
+    /// Sentinel for `last_*_attempt_ago_s` meaning "no attempt yet".
+    pub const ATTEMPT_NEVER: u16 = u16::MAX;
 
     pub fn new(pixel: PixelCoord, last_seen: Instant) -> Self {
         Self {
@@ -90,7 +94,8 @@ impl TrainState {
             last_seen,
             typ: TrainType::Unknown,
             service: ServiceType::Unknown,
-            last_enrichment_ago_ms: Self::ENRICHMENT_NEVER,
+            last_type_attempt_ago_s: Self::ATTEMPT_NEVER,
+            last_service_attempt_ago_s: Self::ATTEMPT_NEVER,
         }
     }
 }

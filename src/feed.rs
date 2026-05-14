@@ -35,11 +35,7 @@ const ZMQ_FRAME_CAP: usize = 64 * 1024;
 const XML_BUF_LEN: usize = 400 * 1024;
 
 #[embassy_executor::task]
-pub async fn run(
-    stack: Stack<'static>,
-    registry: &'static SharedRegistry,
-    queue: &'static NewTrainQueue,
-) {
+pub async fn run(stack: Stack<'static>, registry: &'static SharedRegistry, queue: &'static NewTrainQueue) {
     // Resolve the publisher in a scoped DnsSocket so its smoltcp slot is
     // released before we open the long-lived TCP connection.
     let peer_ip = {
@@ -128,14 +124,15 @@ pub async fn run(
 
         println!(
             "{} KiB XML, {} trains: inflate {} ms, parse {} ms, total {} ms; \
-             registry {} ({} unknown, +{} new, -{} stale, {} wake-skip)",
+             registry {} ({}/{} unknown, +{} new, -{} stale, {} wake-skip)",
             xml_kib,
             trains.len(),
             inflate_ms,
             parse_ms,
             total_ms,
             registry_len,
-            unknowns,
+            unknowns.0,
+            unknowns.1,
             new_count,
             evicted,
             dropped,
