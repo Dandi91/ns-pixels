@@ -9,10 +9,14 @@
 //! The render task currently draws a placeholder gradient; the train registry
 //! is not wired in yet.
 
-use core::sync::atomic::{AtomicU8, AtomicU32, Ordering};
+use core::cell::Cell;
+use core::sync::atomic::{AtomicU32, Ordering};
 
 use embassy_executor::Spawner;
-use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, signal::Signal};
+use embassy_sync::{
+    blocking_mutex::{Mutex as BlockingMutex, raw::CriticalSectionRawMutex},
+    signal::Signal,
+};
 use embassy_time::{Duration, Instant};
 use esp_hal::interrupt::software::SoftwareInterrupt;
 use esp_hal::{
@@ -30,7 +34,7 @@ use esp_println::println;
 use esp_rtos::embassy::{Executor, InterruptExecutor};
 
 use crate::registry::MAX_TRAINS;
-use crate::train::{PixelData, TrainType};
+use crate::train::{PixelData, ServiceType, TrainType};
 use heapless::Vec;
 
 pub const ROWS: usize = 64;
@@ -237,24 +241,17 @@ async fn hub75_task(
 
 /// Visualization modes the renderer can be in. The active mode is selected
 /// externally (button input) and read by [`draw_trains`] each frame.
+/// Animation mode — how a pixel's colors change over time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u8)]
 pub enum VizMode {
     /// Each multi-type pixel cycles through its own member colors locally.
-    PerCluster = 0,
+    PerCluster,
     /// The whole map pulses through the global type cycle; pixels matching
     /// the active type render bright, others dim in their own color.
-    GlobalPulse = 1,
+    GlobalPulse,
 }
 
 impl VizMode {
-    fn from_u8(v: u8) -> Self {
-        match v {
-            1 => VizMode::GlobalPulse,
-            _ => VizMode::PerCluster,
-        }
-    }
-
     pub fn next(self) -> Self {
         match self {
             VizMode::PerCluster => VizMode::GlobalPulse,
@@ -263,14 +260,53 @@ impl VizMode {
     }
 }
 
-static VIZ_MODE: AtomicU8 = AtomicU8::new(VizMode::PerCluster as u8);
-
-pub fn viz_mode() -> VizMode {
-    VizMode::from_u8(VIZ_MODE.load(Ordering::Relaxed))
+/// Color axis — which train property colors are mapped from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ColorMode {
+    /// Color by [`TrainType`] (SNG/SLT/Flirt/…).
+    ByType,
+    /// Color by [`ServiceType`] (Sprinter/Intercity/IntercityDirect/…).
+    ByService,
 }
 
-pub fn set_viz_mode(mode: VizMode) {
-    VIZ_MODE.store(mode as u8, Ordering::Relaxed);
+impl ColorMode {
+    pub fn next(self) -> Self {
+        match self {
+            ColorMode::ByType => ColorMode::ByService,
+            ColorMode::ByService => ColorMode::ByType,
+        }
+    }
+}
+
+/// Combined display configuration. UP cycles `viz`, DOWN cycles `color`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DisplayConfig {
+    pub viz: VizMode,
+    pub color: ColorMode,
+}
+
+impl DisplayConfig {
+    pub const fn new() -> Self {
+        Self {
+            viz: VizMode::PerCluster,
+            color: ColorMode::ByType,
+        }
+    }
+}
+
+static CONFIG: BlockingMutex<CriticalSectionRawMutex, Cell<DisplayConfig>> =
+    BlockingMutex::new(Cell::new(DisplayConfig::new()));
+
+pub fn config() -> DisplayConfig {
+    CONFIG.lock(|c| c.get())
+}
+
+pub fn update_config(f: impl FnOnce(DisplayConfig) -> DisplayConfig) -> DisplayConfig {
+    CONFIG.lock(|c| {
+        let next = f(c.get());
+        c.set(next);
+        next
+    })
 }
 
 /// The display-side cluster snapshot. Producers (feed / ns_api) rebuild into
@@ -304,10 +340,9 @@ const FADE_MS: u64 = 500;
 /// Brightness divisor applied to pixels that don't match the active type.
 const DIM_DIV: u16 = 6;
 
-/// Bit masks of the types the global pulse cycles through, in order.
-/// `Unknown` is intentionally excluded — it stays a flat dim color regardless
-/// of the active slot.
-const ACTIVE_TYPES: [u8; 7] = [
+/// Bit masks the global pulse cycles through, per color axis. `Unknown` is
+/// excluded — it stays flat-dim regardless of the active slot.
+const ACTIVE_TYPE_BITS: &[u8] = &[
     TrainType::SNG_BIT,
     TrainType::SLT_BIT,
     TrainType::FLIRT_BIT,
@@ -316,45 +351,75 @@ const ACTIVE_TYPES: [u8; 7] = [
     TrainType::VIRM_BIT,
     TrainType::ICNG_BIT,
 ];
+const ACTIVE_SERVICE_BITS: &[u8] = &[
+    ServiceType::SPRINTER_BIT,
+    ServiceType::INTERCITY_BIT,
+    ServiceType::INTERCITY_DIRECT_BIT,
+];
 
-/// Plot the current snapshot, dispatching on the active [`VizMode`]. The
-/// snapshot is the display's own buffer; no registry lock is taken here.
-fn draw_trains(fb: &mut FBType, clusters: &ClusterVec) {
-    let now_ms = Instant::now().as_millis();
-    match viz_mode() {
-        VizMode::PerCluster => draw_per_cluster(fb, clusters.as_slice(), now_ms),
-        VizMode::GlobalPulse => draw_global_pulse(fb, clusters.as_slice(), now_ms),
+/// Color axis bound to a [`ColorMode`]: how to extract the relevant bitmask
+/// from a [`PixelData`], the color lookup, and the global-pulse cycle.
+struct Axis {
+    extract: fn(&PixelData) -> u8,
+    color_for: fn(u8) -> [u8; 3],
+    active: &'static [u8],
+}
+
+fn axis_for(mode: ColorMode) -> Axis {
+    match mode {
+        ColorMode::ByType => Axis {
+            extract: |p| p.types,
+            color_for: color_for_type_bit,
+            active: ACTIVE_TYPE_BITS,
+        },
+        ColorMode::ByService => Axis {
+            extract: |p| p.services,
+            color_for: color_for_service_bit,
+            active: ACTIVE_SERVICE_BITS,
+        },
     }
 }
 
-/// Per-pixel cycle: each multi-type pixel independently rotates through its
-/// member colors with a brief cross-fade. Single-type pixels render flat.
-fn draw_per_cluster(fb: &mut FBType, pixels: &[PixelData], now_ms: u64) {
+/// Plot the current snapshot, dispatching on the active [`DisplayConfig`].
+/// The snapshot is the display's own buffer; no registry lock is taken.
+fn draw_trains(fb: &mut FBType, clusters: &ClusterVec) {
+    let cfg = config();
+    let axis = axis_for(cfg.color);
+    let now_ms = Instant::now().as_millis();
+    match cfg.viz {
+        VizMode::PerCluster => draw_per_cluster(fb, clusters.as_slice(), now_ms, &axis),
+        VizMode::GlobalPulse => draw_global_pulse(fb, clusters.as_slice(), now_ms, &axis),
+    }
+}
+
+/// Per-pixel cycle: each multi-bit pixel independently rotates through its
+/// member colors with a brief cross-fade. Single-bit pixels render flat.
+fn draw_per_cluster(fb: &mut FBType, pixels: &[PixelData], now_ms: u64, axis: &Axis) {
     use embedded_graphics::prelude::Point;
     for e in pixels {
-        let rgb = cluster_color(e.types, now_ms);
+        let bits = (axis.extract)(e);
+        let rgb = cluster_color(bits, now_ms, axis);
         let p = Point::new((e.coord_key >> 8) as i32, (e.coord_key & 0xff) as i32);
         fb.set_pixel(p, Color::new(rgb[0], rgb[1], rgb[2]));
     }
 }
 
-/// Pick the cluster's current color from a bitmask of present types. Single
-/// type → flat; multiple bits → cycle through them, holding each for
-/// `SLOT_MS - FADE_MS` then linearly cross-fading into the next over `FADE_MS`.
-fn cluster_color(types: u8, now_ms: u64) -> [u8; 3] {
-    let n = types.count_ones() as u64;
+/// Cycle through every set bit in `bits`, holding each for `SLOT_MS - FADE_MS`
+/// then linearly cross-fading into the next over `FADE_MS`.
+fn cluster_color(bits: u8, now_ms: u64, axis: &Axis) -> [u8; 3] {
+    let n = bits.count_ones() as u64;
     match n {
         0 => [0, 0, 0],
-        1 => color_for_bit(types),
+        1 => (axis.color_for)(bits),
         _ => {
             let phase = now_ms % (n * SLOT_MS);
             let slot = (phase / SLOT_MS) as u32;
             let in_slot = phase % SLOT_MS;
-            let a = color_for_bit(nth_set_bit(types, slot));
+            let a = (axis.color_for)(nth_set_bit(bits, slot));
             if in_slot + FADE_MS <= SLOT_MS {
                 a
             } else {
-                let b = color_for_bit(nth_set_bit(types, (slot + 1) % n as u32));
+                let b = (axis.color_for)(nth_set_bit(bits, (slot + 1) % n as u32));
                 let t = ((in_slot + FADE_MS - SLOT_MS) * 255 / FADE_MS) as u8;
                 blend(a, b, t)
             }
@@ -371,29 +436,30 @@ fn nth_set_bit(mask: u8, n: u32) -> u8 {
     m & m.wrapping_neg()
 }
 
-/// Global pulse: the whole map highlights one type at a time. Pixels matching
-/// the active type render bright; others fall back to a dim color of their
-/// own lowest-set type bit.
-fn draw_global_pulse(fb: &mut FBType, pixels: &[PixelData], now_ms: u64) {
+/// Global pulse: the whole map highlights one axis value at a time. Pixels
+/// matching the active bit render bright; others fall back to a dim color of
+/// their own lowest-set bit on the same axis.
+fn draw_global_pulse(fb: &mut FBType, pixels: &[PixelData], now_ms: u64, axis: &Axis) {
     use embedded_graphics::prelude::Point;
-    let n = ACTIVE_TYPES.len() as u64;
+    let n = axis.active.len() as u64;
     let phase = now_ms % (n * SLOT_MS);
     let slot = (phase / SLOT_MS) as usize;
     let in_slot = phase % SLOT_MS;
-    let active_a = ACTIVE_TYPES[slot];
+    let active_a = axis.active[slot];
     let fade_t = if in_slot + FADE_MS <= SLOT_MS {
         None
     } else {
-        let active_b = ACTIVE_TYPES[(slot + 1) % ACTIVE_TYPES.len()];
+        let active_b = axis.active[(slot + 1) % axis.active.len()];
         let t = ((in_slot + FADE_MS - SLOT_MS) * 255 / FADE_MS) as u8;
         Some((active_b, t))
     };
 
     for e in pixels {
-        let a = pixel_color(e.types, active_a);
+        let bits = (axis.extract)(e);
+        let a = pixel_color(bits, active_a, axis);
         let rgb = match fade_t {
             None => a,
-            Some((active_b, t)) => blend(a, pixel_color(e.types, active_b), t),
+            Some((active_b, t)) => blend(a, pixel_color(bits, active_b, axis), t),
         };
         let p = Point::new((e.coord_key >> 8) as i32, (e.coord_key & 0xff) as i32);
         fb.set_pixel(p, Color::new(rgb[0], rgb[1], rgb[2]));
@@ -401,19 +467,17 @@ fn draw_global_pulse(fb: &mut FBType, pixels: &[PixelData], now_ms: u64) {
 }
 
 /// Pick a pixel's color for one frame of the global pulse: full-bright active
-/// color when the pixel contains the active type, otherwise the dim color of
-/// its lowest-set type bit.
-fn pixel_color(types: u8, active: u8) -> [u8; 3] {
-    if types == 0 {
+/// color when the pixel contains the active bit, otherwise the dim color of
+/// its lowest-set bit on the same axis.
+fn pixel_color(bits: u8, active: u8, axis: &Axis) -> [u8; 3] {
+    if bits == 0 {
         return [0, 0, 0];
     }
-    if types & active != 0 {
-        return color_for_bit(active);
+    if bits & active != 0 {
+        return (axis.color_for)(active);
     }
-    // Lowest set bit — deterministic, and matches `as_bit` ordering so SNG
-    // wins over SLT, etc.
-    let fallback = types & types.wrapping_neg();
-    dim(color_for_bit(fallback))
+    let fallback = bits & bits.wrapping_neg();
+    dim((axis.color_for)(fallback))
 }
 
 fn dim(c: [u8; 3]) -> [u8; 3] {
@@ -434,7 +498,7 @@ fn blend(a: [u8; 3], b: [u8; 3], t: u8) -> [u8; 3] {
 }
 
 /// Map a single-bit `TrainType` mask to its display color.
-fn color_for_bit(bit: u8) -> [u8; 3] {
+fn color_for_type_bit(bit: u8) -> [u8; 3] {
     match bit {
         TrainType::UNKNOWN_BIT => [10, 10, 10], // dim gray
         TrainType::SNG_BIT => [255, 80, 0],     // orange
@@ -444,6 +508,17 @@ fn color_for_bit(bit: u8) -> [u8; 3] {
         TrainType::DDZ_BIT => [0, 255, 80],     // green
         TrainType::VIRM_BIT => [80, 80, 255],   // blue
         TrainType::ICNG_BIT => [255, 255, 255],
+        _ => [0, 0, 0],
+    }
+}
+
+/// Map a single-bit `ServiceType` mask to its display color.
+fn color_for_service_bit(bit: u8) -> [u8; 3] {
+    match bit {
+        ServiceType::UNKNOWN_BIT => [10, 10, 10],    // dim gray
+        ServiceType::SPRINTER_BIT => [0, 200, 255],  // cyan
+        ServiceType::INTERCITY_BIT => [255, 220, 0], // yellow
+        ServiceType::INTERCITY_DIRECT_BIT => [255, 80, 0], // orange
         _ => [0, 0, 0],
     }
 }

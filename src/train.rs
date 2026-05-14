@@ -48,6 +48,24 @@ pub enum ServiceType {
     IntercityDirect,
 }
 
+impl ServiceType {
+    /// Single-bit mask representation; the four variants fit in the low nibble
+    /// of a `u8` so clusters can carry a bitmask of every service type present.
+    pub const fn as_bit(self) -> u8 {
+        match self {
+            ServiceType::Unknown => 1 << 0,
+            ServiceType::Sprinter => 1 << 1,
+            ServiceType::Intercity => 1 << 2,
+            ServiceType::IntercityDirect => 1 << 3,
+        }
+    }
+
+    pub const UNKNOWN_BIT: u8 = Self::Unknown.as_bit();
+    pub const SPRINTER_BIT: u8 = Self::Sprinter.as_bit();
+    pub const INTERCITY_BIT: u8 = Self::Intercity.as_bit();
+    pub const INTERCITY_DIRECT_BIT: u8 = Self::IntercityDirect.as_bit();
+}
+
 /// One row of the live registry. Identified externally by train number.
 #[derive(Debug)]
 pub struct TrainState {
@@ -77,12 +95,14 @@ impl TrainState {
     }
 }
 
-/// One on-screen pixel after cluster collapse. `types` is a bitmask of every
-/// distinct [`TrainType`] sharing this pixel (see [`TrainType::as_bit`]).
+/// One on-screen pixel after cluster collapse. `types` / `services` are
+/// bitmasks of every distinct [`TrainType`] / [`ServiceType`] sharing the
+/// pixel (see the respective `as_bit` methods).
 #[derive(Debug, Clone, Copy)]
 pub struct PixelData {
     pub coord_key: u16,
     pub types: u8,
+    pub services: u8,
 }
 
 impl From<&TrainState> for PixelData {
@@ -90,6 +110,7 @@ impl From<&TrainState> for PixelData {
         Self {
             coord_key: state.pixel.as_u16(),
             types: state.typ.as_bit(),
+            services: state.service.as_bit(),
         }
     }
 }

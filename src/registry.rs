@@ -144,6 +144,7 @@ impl Registry {
             read += 1;
             while read < out.len() && out[read].coord_key == out[write].coord_key {
                 out[write].types |= out[read].types;
+                out[write].services |= out[read].services;
                 read += 1;
             }
             write += 1;

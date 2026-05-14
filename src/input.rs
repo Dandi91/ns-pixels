@@ -2,17 +2,17 @@
 //!
 //! Two momentary buttons (UP / DOWN) are wired to GPIO pins, normally open and
 //! shorting to GND when pressed. Internal pull-ups hold the pin high at rest.
-//! UP cycles through the available [`VizMode`]s; DOWN is reserved for future
-//! use and currently only logs.
+//! UP cycles through the available [`VizMode`]s; DOWN cycles through the
+//! available [`ColorMode`]s.
 
 use embassy_futures::select::{Either, select};
 use embassy_time::{Duration, Timer};
 use esp_hal::gpio::Input;
 use esp_println::println;
 
-use crate::display::{set_viz_mode, viz_mode};
+use crate::display::{DisplayConfig, update_config};
 
-/// Settling time after an edge before re-sampling. Cheap mechanical buttons
+/// Settling time after an edge before re-sampling. Inexpensive mechanical buttons
 /// bounce for a few ms; 30 ms is comfortably past that without feeling laggy.
 const DEBOUNCE: Duration = Duration::from_millis(30);
 
@@ -28,13 +28,19 @@ pub async fn run(mut up: Input<'static>, mut down: Input<'static>) {
         Timer::after(DEBOUNCE).await;
         match edge {
             Either::First(_) if up.is_low() => {
-                let next = viz_mode().next();
-                set_viz_mode(next);
-                println!("input: UP -> {:?}", next);
+                let cfg = update_config(|c| DisplayConfig {
+                    viz: c.viz.next(),
+                    ..c
+                });
+                println!("input: UP -> viz {:?}", cfg.viz);
                 up.wait_for_high().await;
             }
             Either::Second(_) if down.is_low() => {
-                println!("input: DOWN (unbound)");
+                let cfg = update_config(|c| DisplayConfig {
+                    color: c.color.next(),
+                    ..c
+                });
+                println!("input: DOWN -> color {:?}", cfg.color);
                 down.wait_for_high().await;
             }
             _ => {}
