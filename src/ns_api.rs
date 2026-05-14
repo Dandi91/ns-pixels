@@ -128,6 +128,11 @@ pub async fn run(
                     break;
                 }
             }
+
+            {
+                let mut reg = registry.lock().await;
+                reg.rebuild_clusters();
+            }
         }
     }
 }
