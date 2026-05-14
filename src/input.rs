@@ -33,11 +33,8 @@ pub async fn run(mut up: Input<'static>, mut down: Input<'static>) {
                 up.wait_for_high().await;
             }
             Either::Second(_) if down.is_low() => {
-                let cfg = update_config(|c| DisplayConfig {
-                    color: c.color.next(),
-                    ..c
-                });
-                println!("input: DOWN -> color {:?}", cfg.color);
+                let cfg = update_config(|c| DisplayConfig { col: c.col.next(), ..c });
+                println!("input: DOWN -> color {:?}", cfg.col);
                 down.wait_for_high().await;
             }
             _ => {}

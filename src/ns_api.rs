@@ -400,7 +400,10 @@ fn map_category_code(code: &[u8]) -> ServiceType {
 
 fn map_train_type(s: Option<&str>) -> TrainType {
     match s {
-        None => TrainType::Unknown,
+        None => {
+            log::info!("ns_api: empty train type string");
+            TrainType::Unknown
+        }
         Some(s) => {
             // NS returns mixed-case strings like "Flirt", "VIRM-VI", "ICM-III".
             // Strip subtype suffix and normalize to uppercase before matching.

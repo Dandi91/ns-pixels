@@ -17,7 +17,7 @@ use crate::decompress::Decompressor;
 use crate::display;
 use crate::ns_api::NewTrainQueue;
 use crate::projection::wgs84_to_matrix;
-use crate::registry::SharedRegistry;
+use crate::registry::{SharedRegistry, UnknownAxis};
 use crate::xml_parser::{self, Train};
 use crate::{leak_psram_slice, zmq};
 
@@ -33,6 +33,11 @@ const TCP_RX_LEN: usize = 4096;
 const TCP_TX_LEN: usize = 4096;
 const ZMQ_FRAME_CAP: usize = 64 * 1024;
 const XML_BUF_LEN: usize = 400 * 1024;
+
+/// When the count of unknown trains (per axis) drops below this threshold,
+/// log the actual ritnummers — they're likely the persistently-unresolvable
+/// stragglers worth investigating.
+const UNKNOWN_LIST_THRESHOLD: usize = 5;
 
 #[embassy_executor::task]
 pub async fn run(stack: Stack<'static>, registry: &'static SharedRegistry, queue: &'static NewTrainQueue) {
@@ -94,6 +99,8 @@ pub async fn run(stack: Stack<'static>, registry: &'static SharedRegistry, queue
         let mut evicted = 0;
         let registry_len;
         let unknowns;
+        let mut unknown_types: heapless::Vec<u32, { UNKNOWN_LIST_THRESHOLD }> = heapless::Vec::new();
+        let mut unknown_services: heapless::Vec<u32, { UNKNOWN_LIST_THRESHOLD }> = heapless::Vec::new();
         // Grab a free snapshot buffer before locking; if the display hasn't
         // recycled the last one yet, we just skip publishing this round.
         let mut snapshot = display::try_take_free_clusters();
@@ -116,6 +123,12 @@ pub async fn run(stack: Stack<'static>, registry: &'static SharedRegistry, queue
             }
             registry_len = reg.len();
             unknowns = reg.unknown_count();
+            if unknowns.0 > 0 && unknowns.0 < UNKNOWN_LIST_THRESHOLD {
+                reg.unknown_numbers(&mut unknown_types, UnknownAxis::Type);
+            }
+            if unknowns.1 > 0 && unknowns.1 < UNKNOWN_LIST_THRESHOLD {
+                reg.unknown_numbers(&mut unknown_services, UnknownAxis::Service);
+            }
         }
         if let Some(buf) = snapshot {
             display::publish_clusters(buf);
@@ -137,5 +150,11 @@ pub async fn run(stack: Stack<'static>, registry: &'static SharedRegistry, queue
             evicted,
             dropped,
         );
+        if !unknown_types.is_empty() {
+            println!("feed: unknown types: {:?}", unknown_types.as_slice());
+        }
+        if !unknown_services.is_empty() {
+            println!("feed: unknown services: {:?}", unknown_services.as_slice());
+        }
     }
 }

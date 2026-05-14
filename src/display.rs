@@ -169,11 +169,11 @@ async fn display_task(
         count += 1;
         if start.elapsed() > FPS_INTERVAL {
             RENDER_RATE.store(count, Ordering::Relaxed);
-            println!(
-                "display: render {} fps, refresh {} Hz",
-                count / FPS_SECONDS,
-                REFRESH_RATE.load(Ordering::Relaxed) / FPS_SECONDS,
-            );
+            // println!(
+            //     "display: render {} fps, refresh {} Hz",
+            //     count / FPS_SECONDS,
+            //     REFRESH_RATE.load(Ordering::Relaxed) / FPS_SECONDS,
+            // );
             count = 0;
             start = Instant::now();
         }
@@ -277,14 +277,14 @@ impl ColorMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DisplayConfig {
     pub viz: VizMode,
-    pub color: ColorMode,
+    pub col: ColorMode,
 }
 
 impl DisplayConfig {
     pub const fn new() -> Self {
         Self {
             viz: VizMode::PerCluster,
-            color: ColorMode::ByType,
+            col: ColorMode::ByType,
         }
     }
 }
@@ -379,7 +379,7 @@ fn axis_for(mode: ColorMode) -> Axis {
 /// The snapshot is the display's own buffer; no registry lock is taken.
 fn draw_trains(fb: &mut FBType, clusters: &ClusterVec) {
     let cfg = config();
-    let axis = axis_for(cfg.color);
+    let axis = axis_for(cfg.col);
     let now_ms = Instant::now().as_millis();
     match cfg.viz {
         VizMode::PerCluster => draw_per_cluster(fb, clusters.as_slice(), now_ms, &axis),

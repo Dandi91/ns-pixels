@@ -66,6 +66,8 @@ impl Registry {
         if let Some(s) = self.map.get_mut(&number) {
             s.typ = typ;
             s.last_type_attempt_ago_s = attempt_offset_s(s.last_seen, now);
+        } else {
+            log::warn!("set_type: unknown train number {}", number);
         }
     }
 
@@ -76,6 +78,8 @@ impl Registry {
         if let Some(s) = self.map.get_mut(&number) {
             s.service = service;
             s.last_service_attempt_ago_s = attempt_offset_s(s.last_seen, now);
+        } else {
+            log::warn!("set_service: unknown train number {}", number);
         }
     }
 
@@ -99,9 +103,25 @@ impl Registry {
     /// Number of entries whose [`TrainType`] is still [`TrainType::Unknown`]
     /// — i.e. awaiting (or persistently missing) enrichment.
     pub fn unknown_count(&self) -> (usize, usize) {
-        let t =self.map.values().filter(|v| v.typ == TrainType::Unknown).count();
+        let t = self.map.values().filter(|v| v.typ == TrainType::Unknown).count();
         let s = self.map.values().filter(|v| v.service == ServiceType::Unknown).count();
         (t, s)
+    }
+
+    /// Fill `buf` with up to `N` train numbers currently marked unknown for
+    /// the given axis. Useful for debug logging when the count is small.
+    /// Replaces any previous contents of `buf`.
+    pub fn unknown_numbers<const N: usize>(&self, buf: &mut Vec<u32, N>, axis: UnknownAxis) {
+        buf.clear();
+        for (k, v) in self.map.iter() {
+            let is_unknown = match axis {
+                UnknownAxis::Type => v.typ == TrainType::Unknown,
+                UnknownAxis::Service => v.service == ServiceType::Unknown,
+            };
+            if is_unknown && buf.push(*k).is_err() {
+                break;
+            }
+        }
     }
 
     /// Fill `buf` with up to `N` train numbers whose [`TrainType`] is
@@ -214,6 +234,13 @@ fn bump_attempt_ago(ago_s: u16, delta_s: u64) -> u16 {
         return TrainState::ATTEMPT_NEVER;
     }
     (ago_s as u64 + delta_s).min(TrainState::ATTEMPT_NEVER as u64 - 1) as u16
+}
+
+/// Selects which "unknown" axis [`Registry::unknown_numbers`] reports.
+#[derive(Debug, Clone, Copy)]
+pub enum UnknownAxis {
+    Type,
+    Service,
 }
 
 // `CriticalSectionRawMutex` so the rendering task on core 1 can safely lock
