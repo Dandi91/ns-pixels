@@ -27,8 +27,7 @@ pub struct Decompressor {
 impl Decompressor {
     /// Allocate the inflater and a `buf_len`-byte output buffer in PSRAM.
     pub fn new(buf_len: usize) -> Self {
-        let state =
-            Box::<InflateState, _>::new_in(InflateState::new(DataFormat::Raw), ExternalMemory);
+        let state = Box::<InflateState, _>::new_in(InflateState::new(DataFormat::Raw), ExternalMemory);
         let buf = Box::<[u8], _>::new_uninit_slice_in(buf_len, ExternalMemory);
         // SAFETY: u8 has no validity invariants; we only ever read the prefix
         // we just wrote during inflate.

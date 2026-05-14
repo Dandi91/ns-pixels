@@ -216,13 +216,8 @@ async fn hub75_task(
             fb = new_fb;
         }
 
-        let mut xfer = hub75
-            .render(fb)
-            .map_err(|(e, _)| e)
-            .expect("failed to start render!");
-        xfer.wait_for_done()
-            .await
-            .expect("dma wait_for_done failed");
+        let mut xfer = hub75.render(fb).map_err(|(e, _)| e).expect("failed to start render!");
+        xfer.wait_for_done().await.expect("dma wait_for_done failed");
         let (result, new_hub75) = xfer.wait();
         hub75 = new_hub75;
         if let Err(e) = result {
@@ -515,9 +510,9 @@ fn color_for_type_bit(bit: u8) -> [u8; 3] {
 /// Map a single-bit `ServiceType` mask to its display color.
 fn color_for_service_bit(bit: u8) -> [u8; 3] {
     match bit {
-        ServiceType::UNKNOWN_BIT => [10, 10, 10],    // dim gray
-        ServiceType::SPRINTER_BIT => [0, 200, 255],  // cyan
-        ServiceType::INTERCITY_BIT => [255, 220, 0], // yellow
+        ServiceType::UNKNOWN_BIT => [10, 10, 10],          // dim gray
+        ServiceType::SPRINTER_BIT => [0, 200, 255],        // cyan
+        ServiceType::INTERCITY_BIT => [255, 220, 0],       // yellow
         ServiceType::INTERCITY_DIRECT_BIT => [255, 80, 0], // orange
         _ => [0, 0, 0],
     }

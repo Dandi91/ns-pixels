@@ -64,10 +64,7 @@ pub fn wgs84_to_matrix(lat: f32, lon: f32) -> PixelCoord {
     let py = (y - Y_MIN) / M_PER_PIXEL;
     let pixel_x = sat_u8(px);
     let pixel_y = sat_u8(HEIGHT as f32 - py);
-    PixelCoord {
-        x: pixel_x,
-        y: pixel_y,
-    }
+    PixelCoord { x: pixel_x, y: pixel_y }
 }
 
 fn sat_u8(v: f32) -> u8 {

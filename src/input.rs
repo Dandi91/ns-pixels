@@ -28,10 +28,7 @@ pub async fn run(mut up: Input<'static>, mut down: Input<'static>) {
         Timer::after(DEBOUNCE).await;
         match edge {
             Either::First(_) if up.is_low() => {
-                let cfg = update_config(|c| DisplayConfig {
-                    viz: c.viz.next(),
-                    ..c
-                });
+                let cfg = update_config(|c| DisplayConfig { viz: c.viz.next(), ..c });
                 println!("input: UP -> viz {:?}", cfg.viz);
                 up.wait_for_high().await;
             }

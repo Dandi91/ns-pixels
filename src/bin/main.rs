@@ -89,11 +89,7 @@ async fn main(spawner: Spawner) -> ! {
         sw_int.software_interrupt2,
     );
 
-    let station_config = Config::Station(
-        StationConfig::default()
-            .with_ssid(SSID)
-            .with_password(PASSWORD.into()),
-    );
+    let station_config = Config::Station(StationConfig::default().with_ssid(SSID).with_password(PASSWORD.into()));
 
     println!("Starting wifi");
     let (controller, interfaces) = esp_radio::wifi::new(

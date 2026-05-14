@@ -61,10 +61,7 @@ impl<S: Read + Write> Subscriber<S> {
     /// stream. `max_frame_size` caps the size of any single frame we will
     /// allocate to receive (defends against a malicious or buggy peer).
     pub async fn new(socket: S, max_frame_size: usize) -> Result<Self, Error<S::Error>> {
-        let mut sub = Self {
-            socket,
-            max_frame_size,
-        };
+        let mut sub = Self { socket, max_frame_size };
         sub.handshake().await?;
         Ok(sub)
     }
@@ -176,11 +173,7 @@ impl<S: Read + Write> Subscriber<S> {
     async fn read_exact(&mut self, buf: &mut [u8]) -> Result<(), Error<S::Error>> {
         let mut filled = 0;
         while filled < buf.len() {
-            let n = self
-                .socket
-                .read(&mut buf[filled..])
-                .await
-                .map_err(Error::Io)?;
+            let n = self.socket.read(&mut buf[filled..]).await.map_err(Error::Io)?;
             if n == 0 {
                 return Err(Error::UnexpectedEof);
             }
