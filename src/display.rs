@@ -227,58 +227,81 @@ async fn hub75_task(
     }
 }
 
-/// Per-train dwell on its color before the cross-fade into the next cluster
-/// member begins. Total cycle length for a cluster of N is `N * SLOT_MS`.
+/// Dwell time on a single highlighted type before the cross-fade into the
+/// next type begins. Total cycle length is `ACTIVE_TYPES.len() * SLOT_MS`.
 const SLOT_MS: u64 = 1500;
-/// Tail end of each slot spent fading into the next color.
+/// Tail end of each slot spent fading into the next type.
 const FADE_MS: u64 = 500;
+/// Brightness divisor applied to pixels that don't match the active type.
+const DIM_DIV: u16 = 6;
 
-/// Plot every train in the registry. When multiple trains share a pixel,
-/// cycle through their colors over time with a gradual cross-fade.
-/// Holds the registry mutex only for the collection step.
+/// Bit masks of the types the global pulse cycles through, in order.
+/// `Unknown` is intentionally excluded — it stays a flat dim color regardless
+/// of the active slot.
+const ACTIVE_TYPES: [u8; 7] = [
+    TrainType::SNG_BIT,
+    TrainType::SLT_BIT,
+    TrainType::FLIRT_BIT,
+    TrainType::ICM_BIT,
+    TrainType::DDZ_BIT,
+    TrainType::VIRM_BIT,
+    TrainType::ICNG_BIT,
+];
+
+/// Plot every train in the registry, pulsing the whole map through the type
+/// cycle: pixels that include the currently-active type render full bright;
+/// others render dim in their own type color.
 async fn draw_trains(fb: &mut FBType, registry: &SharedRegistry) {
     use embedded_graphics::prelude::Point;
 
     let reg = registry.lock().await;
     let now_ms = Instant::now().as_millis();
+    let n = ACTIVE_TYPES.len() as u64;
+    let phase = now_ms % (n * SLOT_MS);
+    let slot = (phase / SLOT_MS) as usize;
+    let in_slot = phase % SLOT_MS;
+    let active_a = ACTIVE_TYPES[slot];
+    let fade_t = if in_slot + FADE_MS <= SLOT_MS {
+        None
+    } else {
+        let active_b = ACTIVE_TYPES[(slot + 1) % ACTIVE_TYPES.len()];
+        let t = ((in_slot + FADE_MS - SLOT_MS) * 255 / FADE_MS) as u8;
+        Some((active_b, t))
+    };
+
     for e in reg.get_clusterized() {
-        let rgb = cluster_color(e.types, now_ms);
+        let a = pixel_color(e.types, active_a);
+        let rgb = match fade_t {
+            None => a,
+            Some((active_b, t)) => blend(a, pixel_color(e.types, active_b), t),
+        };
         let p = Point::new((e.coord_key >> 8) as i32, (e.coord_key & 0xff) as i32);
         fb.set_pixel(p, Color::new(rgb[0], rgb[1], rgb[2]));
     }
 }
 
-/// Pick the cluster's current color from a bitmask of present types. Single
-/// type → flat; multiple bits → cycle through them, holding each for
-/// `SLOT_MS - FADE_MS` then linearly cross-fading into the next over `FADE_MS`.
-fn cluster_color(types: u8, now_ms: u64) -> [u8; 3] {
-    let n = types.count_ones() as u64;
-    match n {
-        0 => [0, 0, 0],
-        1 => color_for_bit(types),
-        _ => {
-            let phase = now_ms % (n * SLOT_MS);
-            let slot = (phase / SLOT_MS) as u32;
-            let in_slot = phase % SLOT_MS;
-            let a = color_for_bit(nth_set_bit(types, slot));
-            if in_slot + FADE_MS <= SLOT_MS {
-                a
-            } else {
-                let b = color_for_bit(nth_set_bit(types, (slot + 1) % n as u32));
-                let t = ((in_slot + FADE_MS - SLOT_MS) * 255 / FADE_MS) as u8;
-                blend(a, b, t)
-            }
-        }
+/// Pick a pixel's color for one frame of the global pulse: full-bright active
+/// color when the pixel contains the active type, otherwise the dim color of
+/// its lowest-set type bit.
+fn pixel_color(types: u8, active: u8) -> [u8; 3] {
+    if types == 0 {
+        return [0, 0, 0];
     }
+    if types & active != 0 {
+        return color_for_bit(active);
+    }
+    // Lowest set bit — deterministic, and matches `as_bit` ordering so SNG
+    // wins over SLT, etc.
+    let fallback = types & types.wrapping_neg();
+    dim(color_for_bit(fallback))
 }
 
-/// Isolate the `n`-th (zero-indexed) set bit of `mask` as a single-bit `u8`.
-fn nth_set_bit(mask: u8, n: u32) -> u8 {
-    let mut m = mask;
-    for _ in 0..n {
-        m &= m - 1;
-    }
-    m & m.wrapping_neg()
+fn dim(c: [u8; 3]) -> [u8; 3] {
+    [
+        (c[0] as u16 / DIM_DIV) as u8,
+        (c[1] as u16 / DIM_DIV) as u8,
+        (c[2] as u16 / DIM_DIV) as u8,
+    ]
 }
 
 fn blend(a: [u8; 3], b: [u8; 3], t: u8) -> [u8; 3] {
