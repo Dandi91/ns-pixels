@@ -101,7 +101,7 @@ impl Registry {
     }
 
     /// Number of entries whose [`TrainType`] is still [`TrainType::Unknown`]
-    /// — i.e. awaiting (or persistently missing) enrichment.
+    /// — i.e., awaiting (or persistently missing) enrichment.
     pub fn unknown_count(&self) -> (usize, usize) {
         let t = self.map.values().filter(|v| v.typ == TrainType::Unknown).count();
         let s = self.map.values().filter(|v| v.service == ServiceType::Unknown).count();
@@ -124,56 +124,35 @@ impl Registry {
         }
     }
 
-    /// Fill `buf` with up to `N` train numbers whose [`TrainType`] is
-    /// [`TrainType::Unknown`] and whose last type-fetch attempt is older
-    /// than `cooldown`. Replaces any previous contents of `buf`.
-    pub fn pending_enrichment<const N: usize>(&self, buf: &mut Vec<u32, N>, cooldown: Duration) {
-        self.collect_pending(
-            buf,
-            cooldown,
-            |v| v.typ == TrainType::Unknown,
-            |v| v.last_type_attempt_ago_s,
-        );
-    }
-
-    /// Like [`pending_enrichment`], but for service-category enrichment:
-    /// only trains whose [`TrainType`] is already resolved (skipping likely-
-    /// invalid ritnummers), whose [`ServiceType`] is still
-    /// [`ServiceType::Unknown`], and whose last service-fetch attempt is
-    /// older than `cooldown`.
-    pub fn pending_service_enrichment<const N: usize>(&self, buf: &mut Vec<u32, N>, cooldown: Duration) {
-        self.collect_pending(
-            buf,
-            cooldown,
-            |v| v.typ != TrainType::Unknown && v.service == ServiceType::Unknown,
-            |v| v.last_service_attempt_ago_s,
-        );
-    }
-
-    fn collect_pending<const N: usize>(
-        &self,
-        buf: &mut Vec<u32, N>,
-        cooldown: Duration,
-        accept: impl Fn(&TrainState) -> bool,
-        attempt_ago_s: impl Fn(&TrainState) -> u16,
-    ) {
-        buf.clear();
+    /// Append enrichment requests to `buf` for any train whose type or
+    /// service is still unknown and whose corresponding last-attempt is
+    /// outside `cooldown`. Existing entries in `buf` are preserved — the
+    /// caller can pre-populate it (e.g., with newly-seen trains) before
+    /// calling. Stops cleanly when `buf` is full.
+    ///
+    /// The two axes are independent: a train with unknown type may have a
+    /// resolved service category and vice versa, so each is checked on its
+    /// own.
+    pub fn pending_enrichment<const N: usize>(&self, buf: &mut Vec<EnrichmentRequest, N>, cooldown: Duration) {
         let now = Instant::now();
         let cooldown_s = cooldown.as_secs();
         for (k, v) in self.map.iter() {
-            if !accept(v) {
-                continue;
+            if buf.len() == buf.capacity() {
+                break;
             }
-            let ago_s = attempt_ago_s(v);
-            if ago_s != TrainState::ATTEMPT_NEVER {
-                // Time since attempt = (now - last_seen) + offset.
-                let since_seen_s = now.duration_since(v.last_seen).as_secs();
-                let since_attempt_s = since_seen_s + ago_s as u64;
-                if since_attempt_s < cooldown_s {
-                    continue;
+            let since_seen_s = now.duration_since(v.last_seen).as_secs();
+            if v.typ == TrainType::Unknown && ready(v.last_type_attempt_ago_s, since_seen_s, cooldown_s) {
+                if buf.push(EnrichmentRequest::Type(*k)).is_err() {
+                    break;
+                }
+                if buf.len() == buf.capacity() {
+                    break;
                 }
             }
-            if buf.push(*k).is_err() {
+            if v.service == ServiceType::Unknown
+                && ready(v.last_service_attempt_ago_s, since_seen_s, cooldown_s)
+                && buf.push(EnrichmentRequest::Service(*k)).is_err()
+            {
                 break;
             }
         }
@@ -241,6 +220,24 @@ fn bump_attempt_ago(ago_s: u16, delta_s: u64) -> u16 {
 pub enum UnknownAxis {
     Type,
     Service,
+}
+
+/// One unit of enrichment work for the ns_api task: fetch either the train
+/// type or the service category for the given ritnummer.
+#[derive(Debug, Clone, Copy)]
+pub enum EnrichmentRequest {
+    Type(u32),
+    Service(u32),
+}
+
+/// True if the cooldown for an attempt with offset `ago_s` (relative to
+/// `last_seen`, with [`TrainState::ATTEMPT_NEVER`] meaning "no attempt yet")
+/// has elapsed, given `since_seen_s` seconds since `last_seen`.
+fn ready(ago_s: u16, since_seen_s: u64, cooldown_s: u64) -> bool {
+    if ago_s == TrainState::ATTEMPT_NEVER {
+        return true;
+    }
+    since_seen_s + ago_s as u64 >= cooldown_s
 }
 
 // `CriticalSectionRawMutex` so the rendering task on core 1 can safely lock

@@ -1,1 +1,2 @@
 - Display Randstad only
+- Save display config into eeprom 

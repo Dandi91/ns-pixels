@@ -1,18 +1,21 @@
 //! NS API enrichment task.
 //!
-//! Drains the new-train channel and runs two complementary phases against
-//! `gateway.apiportal.ns.nl`:
+//! Drains the new-train channel and pulls additional retry candidates from
+//! [`Registry::pending_enrichment`], merging both into a single buffer of
+//! [`EnrichmentRequest`]s. Per iteration, one TLS connection is opened to
+//! `gateway.apiportal.ns.nl` and reused across every request in the buffer,
+//! amortizing the handshake cost over the whole batch.
 //!
-//! - **Phase A — train type**: batched GET against
-//!   `/virtual-train-api/v1/trein`, ~150 B/train, up to [`BATCH_MAX`] per call.
-//! - **Phase B — service category**: one-train-per-request streaming scan of
-//!   `/reisinformatie-api/api/v2/journey?train=N` for the first occurrence of
-//!   `"categoryCode":"…"`. The full body is ~30 KB but the field lands inside
-//!   the first ~1 KB, so we never buffer the tail.
+//! Each request is one of:
 //!
-//! Both phases share the TLS/HTTP buffers and apply results to the same
-//! [`SharedRegistry`], publishing a fresh cluster snapshot after every
-//! successful call.
+//! - **Type** — `GET /virtual-train-api/v1/trein?ids=N`, ~150 B body, parsed
+//!   as JSON.
+//! - **Service** — `GET /reisinformatie-api/api/v2/journey?train=N`, ~30 KB
+//!   body, streamed and scanned for the first `"categoryCode":"…"` before the
+//!   tail is drained off the connection.
+//!
+//! Both kinds apply their result to the shared [`SharedRegistry`]; a cluster
+//! snapshot is published once the buffer is fully processed.
 
 use core::fmt::Write as _;
 
@@ -23,24 +26,26 @@ use embassy_net::tcp::client::{TcpClient, TcpClientState};
 use embassy_sync::blocking_mutex::raw::NoopRawMutex;
 use embassy_sync::channel::Channel;
 use embassy_time::{Duration, Instant, Timer};
-use embedded_io_async::Read;
+use embedded_io_async::{Read, Write};
 use heapless::{String, Vec};
 use reqwless::{
     client::{HttpClient, TlsConfig, TlsVerify},
-    request::{Method, RequestBuilder},
+    request::RequestBuilder,
 };
 use serde::Deserialize;
 
 use crate::display;
 use crate::leak_psram_slice;
-use crate::registry::SharedRegistry;
+use crate::registry::{EnrichmentRequest, SharedRegistry};
 use crate::train::{ServiceType, TrainType};
 
 pub const QUEUE_CAPACITY: usize = 64;
-pub const BATCH_MAX: usize = 10;
-/// How many service-category lookups to issue per wake-up. Each is a single
-/// HTTPS round-trip, so keep this small to avoid blocking type enrichment.
-const SERVICE_BATCH_MAX: usize = 4;
+/// Total enrichment requests handled per wake-up. Each one is a single HTTPS
+/// round-trip on the shared keep-alive connection (Type requests are further
+/// batched up to [`BATCH_MAX`]).
+const BUFFER_CAP: usize = 32;
+/// Max train numbers per `/virtual-train-api/v1/trein?ids=…` call.
+const BATCH_MAX: usize = 8;
 /// Upper bound on bytes pulled from the journey response before giving up on
 /// finding `categoryCode`. The field reliably appears within the first stop;
 /// 8 KiB is plenty of headroom.
@@ -50,16 +55,19 @@ const SERVICE_SCAN_LIMIT: usize = 8 * 1024;
 const COALESCE: Duration = Duration::from_millis(500);
 /// Fallback wake even if no new-train notifications arrive — picks up trains
 /// dropped from the queue under load and retries failed/missing entries.
-const SWEEP_INTERVAL: Duration = Duration::from_secs(30);
+const SWEEP_INTERVAL: Duration = Duration::from_secs(5);
 /// Pause between API calls if a previous call failed; avoids hammering the
 /// gateway when something is broken.
 const FAILURE_BACKOFF: Duration = Duration::from_secs(10);
 /// Minimum gap between enrichment attempts for the same train number. Trains
 /// whose info the API never returns (or returns in an unparseable form) sit on
 /// this cooldown instead of being re-requested every sweep.
-const RETRY_COOLDOWN: Duration = Duration::from_secs(60);
+const RETRY_COOLDOWN: Duration = Duration::from_secs(120);
 
-const HOST: &str = "gateway.apiportal.ns.nl";
+/// Base URL used for [`HttpClient::resource`] — keeping the connection open
+/// across every enrichment request in the buffer avoids redoing the TLS
+/// handshake for each one.
+const BASE_URL: &str = "https://gateway.apiportal.ns.nl";
 const API_KEY: &str = env!("NS_API_KEY");
 
 // TLS record buffers (~17 KiB each; required for max TLS fragment).
@@ -95,102 +103,119 @@ pub async fn run(
     let tls_write = leak_psram_slice(TLS_BUF_LEN);
     let http_buf = leak_psram_slice(HTTP_BUF_LEN);
 
-    let tcp_state: TcpClientState<1, 4096, 4096> = TcpClientState::new();
+    let tcp_state: TcpClientState<2, 4096, 4096> = TcpClientState::new();
     let tcp_client = TcpClient::new(stack, &tcp_state);
     let dns = DnsSocket::new(stack);
     let mut rng_seed = tls_seed;
 
-    let mut type_batch: Vec<u32, BATCH_MAX> = Vec::new();
-    let mut service_batch: Vec<u32, SERVICE_BATCH_MAX> = Vec::new();
+    let mut buf: Vec<EnrichmentRequest, { BUFFER_CAP * 2 }> = Vec::new();
+    let mut type_batch: Vec<u32, BUFFER_CAP> = Vec::new();
+    let mut service_batch: Vec<u32, BUFFER_CAP> = Vec::new();
 
-    loop {
-        // Wake on either a new-train notification (low-latency path) or the
-        // periodic sweep (covers IDs dropped from a full channel and retries
-        // failed lookups). The channel value itself is unused — registry is
-        // the source of truth for what needs enriching.
-        let _ = select(queue.receive(), Timer::after(SWEEP_INTERVAL)).await;
-        // Drain any other queued wake-hints so they don't cause spurious
-        // immediate re-runs after this iteration.
-        while queue.try_receive().is_ok() {}
+    // Initial delay to let the registry settle before starting enrichment.
+    Timer::after(Duration::from_secs(2)).await;
 
-        // Brief settle window so a burst of notifications coalesces.
-        Timer::after(COALESCE).await;
+    // Outer loop owns the connection lifecycle: a fresh TlsConfig +
+    // HttpClient + resource are built once per iteration and reused across
+    // every wake-up the connection survives. A request failure (including
+    // stale keep-alive being silently dropped by the server) breaks out of
+    // the inner loop and falls through here to rebuild from scratch with a
+    // freshly rotated TLS seed.
+    'connection: loop {
+        rng_seed = rng_seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+        let tls = TlsConfig::new(rng_seed, tls_read, tls_write, TlsVerify::None);
+        let mut http = HttpClient::new_with_tls(&tcp_client, &dns, tls);
 
-        // Phase A: batched train-type fetch.
-        let type_failed = loop {
-            {
-                let reg = registry.lock().await;
-                reg.pending_enrichment(&mut type_batch, RETRY_COOLDOWN);
-            }
-            if type_batch.is_empty() {
-                break false;
-            }
-
-            rng_seed = rng_seed.wrapping_mul(6364136223846793005).wrapping_add(1);
-            let tls = TlsConfig::new(rng_seed, tls_read, tls_write, TlsVerify::None);
-            let mut http = HttpClient::new_with_tls(&tcp_client, &dns, tls);
-
-            match fetch_types(&mut http, http_buf, &type_batch, registry).await {
-                Ok(applied) => {
-                    log::info!("ns_api: type fetched {}/{}", applied, type_batch.len());
-                    publish_snapshot(registry).await;
-                }
-                Err(e) => {
-                    log::warn!("ns_api: type fetch failed: {:?} (batch={:?})", e, type_batch.as_slice());
-                    break true;
-                }
+        let mut resource = match http.resource(BASE_URL).await {
+            Ok(r) => r,
+            Err(e) => {
+                log::warn!("ns_api: resource open failed: {:?}", e);
+                Timer::after(FAILURE_BACKOFF).await;
+                continue 'connection;
             }
         };
 
-        if type_failed {
-            Timer::after(FAILURE_BACKOFF).await;
-            continue;
-        }
+        loop {
+            // Wake on either a new-train notification (low-latency path) or the periodic sweep
+            // (covers IDs dropped from a full channel and retries failed lookups).
+            let _ = select(queue.receive(), Timer::after(SWEEP_INTERVAL)).await;
 
-        // Phase B: per-train service-category fetch via streaming scan.
-        let service_failed = loop {
-            {
-                let reg = registry.lock().await;
-                reg.pending_service_enrichment(&mut service_batch, RETRY_COOLDOWN);
-            }
-            if service_batch.is_empty() {
-                break false;
-            }
+            // Brief settle window so a burst of notifications coalesces.
+            Timer::after(COALESCE).await;
 
-            let mut any_failure = false;
-            // SERVICE_BATCH_MAX is small; doing each call sequentially keeps
-            // the TLS buffers reusable. Each iteration creates a fresh client.
-            for &number in service_batch.iter() {
-                rng_seed = rng_seed.wrapping_mul(6364136223846793005).wrapping_add(1);
-                let tls = TlsConfig::new(rng_seed, tls_read, tls_write, TlsVerify::None);
-                let mut http = HttpClient::new_with_tls(&tcp_client, &dns, tls);
-
-                match fetch_service(&mut http, http_buf, number, registry).await {
-                    Ok(service) => {
-                        log::info!("ns_api: service {} -> {:?}", number, service);
+            // Build the request buffer. New trains land here first as a (Type, Service) pair each;
+            // pending_enrichment then tops up the rest with retry candidates from the registry.
+            buf.clear();
+            while buf.capacity() - buf.len() >= 2 {
+                match queue.try_receive() {
+                    Ok(n) => {
+                        let _ = buf.push(EnrichmentRequest::Type(n));
+                        let _ = buf.push(EnrichmentRequest::Service(n));
                     }
+                    Err(_) => break,
+                }
+            }
+            // Only check for pending enrichment if there were no new trains.
+            // Otherwise, some trains may be requested twice
+            if buf.is_empty() {
+                let reg = registry.lock().await;
+                reg.pending_enrichment(&mut buf, RETRY_COOLDOWN);
+            }
+            if buf.is_empty() {
+                continue;
+            }
+
+            // Partition by axis so Type requests can be coalesced into batched URL calls;
+            // Service requests stay one-per-call (the journey endpoint takes a single train).
+            type_batch.clear();
+            service_batch.clear();
+            for &req in buf.iter() {
+                match req {
+                    EnrichmentRequest::Type(n) => {
+                        let _ = type_batch.push(n);
+                    }
+                    EnrichmentRequest::Service(n) => {
+                        let _ = service_batch.push(n);
+                    }
+                }
+            }
+
+            let mut failed = false;
+            for chunk in type_batch.chunks(BATCH_MAX) {
+                match fetch_types_on(&mut resource, http_buf, chunk, registry).await {
+                    Ok(applied) => log::info!("ns_api: type batch {}/{} resolved", applied, chunk.len()),
                     Err(e) => {
-                        log::warn!("ns_api: service fetch {} failed: {:?}", number, e);
-                        any_failure = true;
+                        log::warn!("ns_api: type batch {:?} failed: {:?}", chunk, e);
+                        failed = true;
                         break;
                     }
                 }
             }
-            publish_snapshot(registry).await;
-            if any_failure {
-                break true;
+            if !failed {
+                for &n in service_batch.iter() {
+                    match fetch_service_on(&mut resource, http_buf, n, registry).await {
+                        Ok(s) => log::info!("ns_api: service {} -> {:?}", n, s),
+                        Err(e) => {
+                            log::warn!("ns_api: service {} failed: {:?}", n, e);
+                            failed = true;
+                            break;
+                        }
+                    }
+                }
             }
-        };
-
-        if service_failed {
-            Timer::after(FAILURE_BACKOFF).await;
+            publish_snapshot(registry).await;
+            if failed {
+                // Connection may be dead (stale keep-alive, server-side close, TLS desync).
+                // Tear it down and reconnect.
+                Timer::after(FAILURE_BACKOFF).await;
+                continue 'connection;
+            }
         }
     }
 }
 
 /// Rebuild the cluster snapshot and hand it to the display, if a free buffer
-/// is available. Skipping when none is free is fine — the next refresh catches
-/// up.
+/// is available. Skipping when none is free is fine — the next refresh catches up.
 async fn publish_snapshot(registry: &SharedRegistry) {
     if let Some(buf) = display::try_take_free_clusters() {
         {
@@ -211,34 +236,52 @@ enum FetchError {
     Stream,
 }
 
-async fn fetch_types<'a, T, D>(
-    http: &mut HttpClient<'a, T, D>,
+/// Fetch train-type records for up to [`BATCH_MAX`] ritnummers in a single
+/// `?ids=N1,N2,…` call over the shared keep-alive connection. Applies each
+/// resolved [`TrainType`] (or [`TrainType::Unknown`] if NS has no
+/// well-formed record) to the registry, stamping the cooldown for every
+/// requested train. Returns the count of trains that resolved to a concrete
+/// type.
+async fn fetch_types_on<'res, C>(
+    resource: &mut reqwless::client::HttpResource<'res, C>,
     http_buf: &mut [u8],
     batch: &[u32],
     registry: &SharedRegistry,
 ) -> Result<usize, FetchError>
 where
-    T: embedded_nal_async::TcpConnect + 'a,
-    D: embedded_nal_async::Dns + 'a,
+    C: Read + Write,
 {
-    // Build URL: https://<host>/virtual-train-api/v1/trein?ids=<comma-separated-ids>
-    // Max length: scheme+host (~50) + base (32) + BATCH_MAX*7 + 9 commas ≈ 160.
-    let mut url: String<256> = String::new();
-    let _ = write!(url, "https://{HOST}/virtual-train-api/v1/trein?ids=");
+    debug_assert!(!batch.is_empty() && batch.len() <= BATCH_MAX);
+
+    // Max length: base (~32) + BATCH_MAX*7 digits + 9 commas ≈ 110.
+    let mut path: String<160> = String::new();
+    let _ = write!(path, "/virtual-train-api/v1/trein?ids=");
     for (i, id) in batch.iter().enumerate() {
         if i > 0 {
-            let _ = url.push(',');
+            let _ = path.push(',');
         }
-        let _ = write!(url, "{}", id);
+        let _ = write!(path, "{}", id);
     }
 
     let headers = [("Ocp-Apim-Subscription-Key", API_KEY), ("Accept", "application/json")];
-    let req = http.request(Method::GET, &url).await.map_err(FetchError::Http)?;
-    let mut req = req.headers(&headers);
-    let resp = req.send(http_buf).await.map_err(FetchError::Http)?;
+    let resp = resource
+        .get(&path)
+        .headers(&headers)
+        .send(http_buf)
+        .await
+        .map_err(FetchError::Http)?;
 
     let status = resp.status;
     if !status.is_successful() {
+        let mut reader = resp.body().reader();
+        let _ = drain(&mut reader).await;
+        // Still stamp every batch member so the cooldown is honored,
+        // and we don't immediately retry on the next sweep.
+        let now = Instant::now();
+        let mut reg = registry.lock().await;
+        for &n in batch {
+            reg.set_type(n, TrainType::Unknown, now);
+        }
         return Err(FetchError::HttpStatus(status.0));
     }
 
@@ -264,31 +307,39 @@ where
     Ok(applied)
 }
 
-/// Stream the journey response for `number`, scan for the first
-/// `"categoryCode":"…"`, and apply the result to the registry. Reads at most
-/// [`SERVICE_SCAN_LIMIT`] bytes before giving up so we never buffer the 30 KB
-/// of stops we don't care about.
-async fn fetch_service<'a, T, D>(
-    http: &mut HttpClient<'a, T, D>,
+/// Stream the journey response for `number` over an already-open keep-alive
+/// connection, scan for the first `"categoryCode":"…"`, drain the rest of the
+/// body so the connection is reusable, and apply the result to the registry.
+/// At most [`SERVICE_SCAN_LIMIT`] bytes are scanned before bailing; the
+/// remaining body bytes are still drained so the next request on this
+/// connection sees clean framing.
+async fn fetch_service_on<'res, C>(
+    resource: &mut reqwless::client::HttpResource<'res, C>,
     http_buf: &mut [u8],
     number: u32,
     registry: &SharedRegistry,
 ) -> Result<ServiceType, FetchError>
 where
-    T: embedded_nal_async::TcpConnect + 'a,
-    D: embedded_nal_async::Dns + 'a,
+    C: Read + Write,
 {
-    let mut url: String<160> = String::new();
-    let _ = write!(url, "https://{HOST}/reisinformatie-api/api/v2/journey?train={number}");
+    let mut path: String<128> = String::new();
+    let _ = write!(path, "/reisinformatie-api/api/v2/journey?train={number}");
 
     let headers = [("Ocp-Apim-Subscription-Key", API_KEY), ("Accept", "application/json")];
-    let req = http.request(Method::GET, &url).await.map_err(FetchError::Http)?;
-    let mut req = req.headers(&headers);
-    let resp = req.send(http_buf).await.map_err(FetchError::Http)?;
+    let resp = resource
+        .get(&path)
+        .headers(&headers)
+        .send(http_buf)
+        .await
+        .map_err(FetchError::Http)?;
 
     let status = resp.status;
     if !status.is_successful() {
-        // Non-2xx (incl. 404 "Deze trein kan niet gevonden") - stamp the train as attempted so we honour the cooldown
+        // Non-2xx (incl. 404 "Deze trein kan niet gevonden") - stamp the train
+        // as attempted so we honor the cooldown. The body is short for error responses,
+        // so we still drain it to keep the connection alive.
+        let mut reader = resp.body().reader();
+        let _ = drain(&mut reader).await;
         let now = Instant::now();
         let mut reg = registry.lock().await;
         reg.set_service(number, ServiceType::Unknown, now);
@@ -297,6 +348,10 @@ where
 
     let mut reader = resp.body().reader();
     let service = scan_category(&mut reader).await?;
+    // Drain the remaining body so the next request on this keep-alive
+    // connection doesn't read stale bytes as its response headers. If draining
+    // errors, propagate so the caller drops the resource and reconnects.
+    drain(&mut reader).await.map_err(|_| FetchError::Stream)?;
 
     let now = Instant::now();
     {
@@ -304,6 +359,21 @@ where
         reg.set_service(number, service, now);
     }
     Ok(service)
+}
+
+/// Read and discard everything remaining on `reader` until EOF. Required after
+/// [`scan_category`] aborts early, so the keep-alive connection stays framed.
+async fn drain<R>(reader: &mut R) -> Result<(), R::Error>
+where
+    R: Read,
+{
+    let mut sink = [0u8; 256];
+    loop {
+        let n = reader.read(&mut sink).await?;
+        if n == 0 {
+            return Ok(());
+        }
+    }
 }
 
 /// Scan the streamed body for the first `"categoryCode":"XYZ"`. Returns the
@@ -400,10 +470,7 @@ fn map_category_code(code: &[u8]) -> ServiceType {
 
 fn map_train_type(s: Option<&str>) -> TrainType {
     match s {
-        None => {
-            log::info!("ns_api: empty train type string");
-            TrainType::Unknown
-        }
+        None => TrainType::Unknown,
         Some(s) => {
             // NS returns mixed-case strings like "Flirt", "VIRM-VI", "ICM-III".
             // Strip subtype suffix and normalize to uppercase before matching.
