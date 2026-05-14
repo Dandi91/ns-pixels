@@ -43,8 +43,8 @@ pub const BATCH_MAX: usize = 10;
 const SERVICE_BATCH_MAX: usize = 4;
 /// Upper bound on bytes pulled from the journey response before giving up on
 /// finding `categoryCode`. The field reliably appears within the first stop;
-/// 4 KiB is plenty of headroom.
-const SERVICE_SCAN_LIMIT: usize = 4 * 1024;
+/// 8 KiB is plenty of headroom.
+const SERVICE_SCAN_LIMIT: usize = 8 * 1024;
 
 /// Brief window after a wake-up to let the registry settle before sweeping.
 const COALESCE: Duration = Duration::from_millis(500);
@@ -390,7 +390,7 @@ fn map_category_code(code: &[u8]) -> ServiceType {
     match code {
         b"SPR" => ServiceType::Sprinter,
         b"IC" => ServiceType::Intercity,
-        b"ICD" => ServiceType::IntercityDirect,
+        b"ICD" | b"ECD" => ServiceType::IntercityDirect,
         _ => {
             log::info!("ns_api: unknown train service string {:?}", code);
             ServiceType::Unknown

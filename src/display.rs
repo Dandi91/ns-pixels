@@ -513,7 +513,7 @@ fn color_for_service_bit(bit: u8) -> [u8; 3] {
         ServiceType::UNKNOWN_BIT => [10, 10, 10],          // dim gray
         ServiceType::SPRINTER_BIT => [0, 200, 255],        // cyan
         ServiceType::INTERCITY_BIT => [255, 220, 0],       // yellow
-        ServiceType::INTERCITY_DIRECT_BIT => [255, 80, 0], // orange
+        ServiceType::INTERCITY_DIRECT_BIT => [255, 10, 0], // red
         _ => [0, 0, 0],
     }
 }
