@@ -55,17 +55,24 @@ pub struct TrainState {
     pub last_seen: Instant,
     pub typ: TrainType,
     pub service: ServiceType,
-    pub last_enrichment: Option<Instant>,
+    /// Milliseconds between `last_seen` and the most recent enrichment
+    /// attempt, i.e. `last_seen - last_enrichment`. Sentinel
+    /// [`TrainState::ENRICHMENT_NEVER`] means no attempt has been made yet.
+    /// Trains live at most 5 minutes, so the value never exceeds 300 000.
+    pub last_enrichment_ago_ms: u32,
 }
 
 impl TrainState {
+    /// Sentinel for `last_enrichment_ago_ms` meaning "no attempt yet".
+    pub const ENRICHMENT_NEVER: u32 = u32::MAX;
+
     pub fn new(pixel: PixelCoord, last_seen: Instant) -> Self {
         Self {
             pixel,
             last_seen,
             typ: TrainType::Unknown,
             service: ServiceType::Unknown,
-            last_enrichment: None,
+            last_enrichment_ago_ms: Self::ENRICHMENT_NEVER,
         }
     }
 }

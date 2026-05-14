@@ -51,12 +51,19 @@ impl Registry {
     }
 
     /// Record an enrichment result for `number`. Always stamps
-    /// `last_enrichment_attempt` so unresolved trains (passed as
+    /// `last_enrichment_ago_ms` so unresolved trains (passed as
     /// [`TrainType::Unknown`]) sit on the cooldown.
     pub fn set_type(&mut self, number: u32, typ: TrainType, now: Instant) {
         if let Some(s) = self.map.get_mut(&number) {
             s.typ = typ;
-            s.last_enrichment = Some(now);
+            // Offset relative to last_seen. ns_api typically fires shortly
+            // after feed has refreshed last_seen, so the offset is small;
+            // if last_seen happens to be in the future (clock skew across
+            // updates), saturate to 0.
+            s.last_enrichment_ago_ms = now
+                .checked_duration_since(s.last_seen)
+                .map(|d| d.as_millis() as u32)
+                .unwrap_or(0);
         }
     }
 
@@ -92,12 +99,16 @@ impl Registry {
     pub fn pending_enrichment<const N: usize>(&self, buf: &mut Vec<u32, N>, cooldown: Duration) {
         buf.clear();
         let now = Instant::now();
+        let cooldown_ms = cooldown.as_millis();
         for (k, v) in self.map.iter() {
             if v.typ != TrainType::Unknown {
                 continue;
             }
-            if let Some(last) = v.last_enrichment {
-                if now.duration_since(last) < cooldown {
+            if v.last_enrichment_ago_ms != TrainState::ENRICHMENT_NEVER {
+                // Time since last attempt = (now - last_seen) + offset.
+                let since_seen_ms = now.duration_since(v.last_seen).as_millis();
+                let since_attempt_ms = since_seen_ms + v.last_enrichment_ago_ms as u64;
+                if since_attempt_ms < cooldown_ms {
                     continue;
                 }
             }
