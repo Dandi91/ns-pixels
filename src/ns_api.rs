@@ -43,7 +43,7 @@ pub const QUEUE_CAPACITY: usize = 64;
 /// Total enrichment requests handled per wake-up. Each one is a single HTTPS
 /// round-trip on the shared keep-alive connection (Type requests are further
 /// batched up to [`BATCH_MAX`]).
-const BUFFER_CAP: usize = 32;
+const BUFFER_CAP: usize = 16;
 /// Max train numbers per `/virtual-train-api/v1/trein?ids=…` call.
 const BATCH_MAX: usize = 8;
 /// Upper bound on bytes pulled from the journey response before giving up on
@@ -103,7 +103,7 @@ pub async fn run(
     let tls_write = leak_psram_slice(TLS_BUF_LEN);
     let http_buf = leak_psram_slice(HTTP_BUF_LEN);
 
-    let tcp_state: TcpClientState<2, 4096, 4096> = TcpClientState::new();
+    let tcp_state: TcpClientState<1, 4096, 4096> = TcpClientState::new();
     let tcp_client = TcpClient::new(stack, &tcp_state);
     let dns = DnsSocket::new(stack);
     let mut rng_seed = tls_seed;
@@ -115,101 +115,95 @@ pub async fn run(
     // Initial delay to let the registry settle before starting enrichment.
     Timer::after(Duration::from_secs(2)).await;
 
-    // Outer loop owns the connection lifecycle: a fresh TlsConfig +
-    // HttpClient + resource are built once per iteration and reused across
-    // every wake-up the connection survives. A request failure (including
-    // stale keep-alive being silently dropped by the server) breaks out of
-    // the inner loop and falls through here to rebuild from scratch with a
-    // freshly rotated TLS seed.
-    'connection: loop {
+    // One TLS session per non-empty wake-up: built right before use and
+    // dropped right after. This keeps handshake amortization within a batch
+    // (BATCH_MAX type-requests + up to BUFFER_CAP service requests share
+    // one TLS connection) while avoiding idle sessions across batches.
+    loop {
+        // Wake on either a new-train notification (low-latency path) or the periodic sweep
+        // (covers IDs dropped from a full channel and retries failed lookups).
+        let _ = select(queue.receive(), Timer::after(SWEEP_INTERVAL)).await;
+
+        // Brief settle window so a burst of notifications coalesces.
+        Timer::after(COALESCE).await;
+
+        // Build the request buffer. New trains land here first as a (Type, Service) pair each;
+        // pending_enrichment then tops up the rest with retry candidates from the registry.
+        buf.clear();
+        while buf.capacity() - buf.len() >= 2 {
+            match queue.try_receive() {
+                Ok(n) => {
+                    let _ = buf.push(EnrichmentRequest::Type(n));
+                    let _ = buf.push(EnrichmentRequest::Service(n));
+                }
+                Err(_) => break,
+            }
+        }
+        // Only check for pending enrichment if there were no new trains.
+        // Otherwise, some trains may be requested twice
+        if buf.is_empty() {
+            let reg = registry.lock().await;
+            reg.pending_enrichment(&mut buf, RETRY_COOLDOWN);
+        }
+        if buf.is_empty() {
+            continue;
+        }
+
+        // Partition by axis so Type requests can be coalesced into batched URL calls;
+        // Service requests stay one-per-call (the journey endpoint takes a single train).
+        type_batch.clear();
+        service_batch.clear();
+        for &req in buf.iter() {
+            match req {
+                EnrichmentRequest::Type(n) => {
+                    let _ = type_batch.push(n);
+                }
+                EnrichmentRequest::Service(n) => {
+                    let _ = service_batch.push(n);
+                }
+            }
+        }
+
+        // Now that we have work, open a fresh TLS session and use it for
+        // every request in this batch. Dropped at the end of the iteration.
         rng_seed = rng_seed.wrapping_mul(6364136223846793005).wrapping_add(1);
         let tls = TlsConfig::new(rng_seed, tls_read, tls_write, TlsVerify::None);
         let mut http = HttpClient::new_with_tls(&tcp_client, &dns, tls);
-
         let mut resource = match http.resource(BASE_URL).await {
             Ok(r) => r,
             Err(e) => {
                 log::warn!("ns_api: resource open failed: {:?}", e);
                 Timer::after(FAILURE_BACKOFF).await;
-                continue 'connection;
+                continue;
             }
         };
 
-        loop {
-            // Wake on either a new-train notification (low-latency path) or the periodic sweep
-            // (covers IDs dropped from a full channel and retries failed lookups).
-            let _ = select(queue.receive(), Timer::after(SWEEP_INTERVAL)).await;
-
-            // Brief settle window so a burst of notifications coalesces.
-            Timer::after(COALESCE).await;
-
-            // Build the request buffer. New trains land here first as a (Type, Service) pair each;
-            // pending_enrichment then tops up the rest with retry candidates from the registry.
-            buf.clear();
-            while buf.capacity() - buf.len() >= 2 {
-                match queue.try_receive() {
-                    Ok(n) => {
-                        let _ = buf.push(EnrichmentRequest::Type(n));
-                        let _ = buf.push(EnrichmentRequest::Service(n));
-                    }
-                    Err(_) => break,
+        let mut failed = false;
+        for chunk in type_batch.chunks(BATCH_MAX) {
+            match fetch_types_on(&mut resource, http_buf, chunk, registry).await {
+                Ok(applied) => log::info!("ns_api: type batch {}/{} resolved", applied, chunk.len()),
+                Err(e) => {
+                    log::warn!("ns_api: type batch {:?} failed: {:?}", chunk, e);
+                    failed = true;
+                    break;
                 }
             }
-            // Only check for pending enrichment if there were no new trains.
-            // Otherwise, some trains may be requested twice
-            if buf.is_empty() {
-                let reg = registry.lock().await;
-                reg.pending_enrichment(&mut buf, RETRY_COOLDOWN);
-            }
-            if buf.is_empty() {
-                continue;
-            }
-
-            // Partition by axis so Type requests can be coalesced into batched URL calls;
-            // Service requests stay one-per-call (the journey endpoint takes a single train).
-            type_batch.clear();
-            service_batch.clear();
-            for &req in buf.iter() {
-                match req {
-                    EnrichmentRequest::Type(n) => {
-                        let _ = type_batch.push(n);
-                    }
-                    EnrichmentRequest::Service(n) => {
-                        let _ = service_batch.push(n);
-                    }
-                }
-            }
-
-            let mut failed = false;
-            for chunk in type_batch.chunks(BATCH_MAX) {
-                match fetch_types_on(&mut resource, http_buf, chunk, registry).await {
-                    Ok(applied) => log::info!("ns_api: type batch {}/{} resolved", applied, chunk.len()),
+        }
+        if !failed {
+            for &n in service_batch.iter() {
+                match fetch_service_on(&mut resource, http_buf, n, registry).await {
+                    Ok(s) => log::info!("ns_api: service {} -> {:?}", n, s),
                     Err(e) => {
-                        log::warn!("ns_api: type batch {:?} failed: {:?}", chunk, e);
+                        log::warn!("ns_api: service {} failed: {:?}", n, e);
                         failed = true;
                         break;
                     }
                 }
             }
-            if !failed {
-                for &n in service_batch.iter() {
-                    match fetch_service_on(&mut resource, http_buf, n, registry).await {
-                        Ok(s) => log::info!("ns_api: service {} -> {:?}", n, s),
-                        Err(e) => {
-                            log::warn!("ns_api: service {} failed: {:?}", n, e);
-                            failed = true;
-                            break;
-                        }
-                    }
-                }
-            }
-            publish_snapshot(registry).await;
-            if failed {
-                // Connection may be dead (stale keep-alive, server-side close, TLS desync).
-                // Tear it down and reconnect.
-                Timer::after(FAILURE_BACKOFF).await;
-                continue 'connection;
-            }
+        }
+        publish_snapshot(registry).await;
+        if failed {
+            Timer::after(FAILURE_BACKOFF).await;
         }
     }
 }
