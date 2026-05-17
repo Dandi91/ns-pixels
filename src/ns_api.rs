@@ -11,8 +11,8 @@
 //! - **Type** — `GET /virtual-train-api/v1/trein?ids=N`, ~150 B body, parsed
 //!   as JSON.
 //! - **Service** — `GET /reisinformatie-api/api/v2/journey?train=N`, ~30 KB
-//!   body, streamed and scanned for the first `"categoryCode":"…"` before the
-//!   tail is drained off the connection.
+//!   body, read fully into the HTTP buffer and deserialized with serde to
+//!   pull out the first `categoryCode`.
 //!
 //! Both kinds apply their result to the shared [`SharedRegistry`]; a cluster
 //! snapshot is published once the buffer is fully processed.
@@ -46,11 +46,6 @@ pub const QUEUE_CAPACITY: usize = 64;
 const BUFFER_CAP: usize = 16;
 /// Max train numbers per `/virtual-train-api/v1/trein?ids=…` call.
 const BATCH_MAX: usize = 8;
-/// Upper bound on bytes pulled from the journey response before giving up on
-/// finding `categoryCode`. The field reliably appears within the first stop;
-/// 8 KiB is plenty of headroom.
-const SERVICE_SCAN_LIMIT: usize = 8 * 1024;
-
 /// Brief window after a wake-up to let the registry settle before sweeping.
 const COALESCE: Duration = Duration::from_millis(500);
 /// Fallback wake even if no new-train notifications arrive — picks up trains
@@ -72,9 +67,10 @@ const API_KEY: &str = env!("NS_API_KEY");
 
 // TLS record buffers (~17 KiB each; required for max TLS fragment).
 const TLS_BUF_LEN: usize = 17 * 1024;
-// HTTP response buffer. Each train is ~150 bytes of JSON; 16 KiB comfortably
-// covers BATCH_MAX entries plus headers.
-const HTTP_BUF_LEN: usize = 16 * 1024;
+// HTTP response buffer. Sized for the journey endpoint (~30 KB per response)
+// with comfortable headroom so the full body can be read into memory before
+// serde deserialization.
+const HTTP_BUF_LEN: usize = 64 * 1024;
 
 pub type NewTrainQueue = Channel<NoopRawMutex, u32, QUEUE_CAPACITY>;
 
@@ -87,6 +83,44 @@ struct TrainInfo<'a> {
     number: u32,
     #[serde(rename = "type", borrow, default)]
     train_type: Option<&'a str>,
+}
+
+// Bounds for the journey response payload. NS journeys typically have ~10–20
+// stops with one departure and arrival each; the caps below leave headroom
+// without inflating the parsed structure beyond a few KB.
+const MAX_STOPS: usize = 64;
+const MAX_EVENTS: usize = 4;
+
+#[derive(Deserialize)]
+struct JourneyResp<'a> {
+    #[serde(borrow)]
+    payload: JourneyPayload<'a>,
+}
+
+#[derive(Deserialize)]
+struct JourneyPayload<'a> {
+    #[serde(borrow)]
+    stops: Vec<JourneyStop<'a>, MAX_STOPS>,
+}
+
+#[derive(Deserialize)]
+struct JourneyStop<'a> {
+    #[serde(borrow, default)]
+    departures: Vec<JourneyEvent<'a>, MAX_EVENTS>,
+    #[serde(borrow, default)]
+    arrivals: Vec<JourneyEvent<'a>, MAX_EVENTS>,
+}
+
+#[derive(Deserialize, Default)]
+struct JourneyEvent<'a> {
+    #[serde(borrow, default)]
+    product: Option<JourneyProduct<'a>>,
+}
+
+#[derive(Deserialize)]
+struct JourneyProduct<'a> {
+    #[serde(rename = "categoryCode", borrow, default)]
+    category_code: Option<&'a str>,
 }
 
 #[embassy_executor::task]
@@ -111,9 +145,6 @@ pub async fn run(
     let mut buf: Vec<EnrichmentRequest, { BUFFER_CAP * 2 }> = Vec::new();
     let mut type_batch: Vec<u32, BUFFER_CAP> = Vec::new();
     let mut service_batch: Vec<u32, BUFFER_CAP> = Vec::new();
-
-    // Initial delay to let the registry settle before starting enrichment.
-    Timer::after(Duration::from_secs(2)).await;
 
     // One TLS session per non-empty wake-up: built right before use and
     // dropped right after. This keeps handshake amortization within a batch
@@ -227,7 +258,6 @@ enum FetchError {
     HttpStatus(u16),
     InvalidUtf8,
     Json,
-    Stream,
 }
 
 /// Fetch train-type records for up to [`BATCH_MAX`] ritnummers in a single
@@ -267,8 +297,7 @@ where
 
     let status = resp.status;
     if !status.is_successful() {
-        let mut reader = resp.body().reader();
-        let _ = drain(&mut reader).await;
+        let _ = resp.body().read_to_end().await;
         // Still stamp every batch member so the cooldown is honored,
         // and we don't immediately retry on the next sweep.
         let now = Instant::now();
@@ -301,12 +330,10 @@ where
     Ok(applied)
 }
 
-/// Stream the journey response for `number` over an already-open keep-alive
-/// connection, scan for the first `"categoryCode":"…"`, drain the rest of the
-/// body so the connection is reusable, and apply the result to the registry.
-/// At most [`SERVICE_SCAN_LIMIT`] bytes are scanned before bailing; the
-/// remaining body bytes are still drained so the next request on this
-/// connection sees clean framing.
+/// Fetch the journey response for `number` over an already-open keep-alive
+/// connection, deserialize it with serde, and apply the resolved
+/// [`ServiceType`] to the registry. The first `categoryCode` found while
+/// walking the parsed stops (departures first, then arrivals) wins.
 async fn fetch_service_on<'res, C>(
     resource: &mut reqwless::client::HttpResource<'res, C>,
     http_buf: &mut [u8],
@@ -330,22 +357,29 @@ where
     let status = resp.status;
     if !status.is_successful() {
         // Non-2xx (incl. 404 "Deze trein kan niet gevonden") - stamp the train
-        // as attempted so we honor the cooldown. The body is short for error responses,
-        // so we still drain it to keep the connection alive.
-        let mut reader = resp.body().reader();
-        let _ = drain(&mut reader).await;
+        // as attempted so we honor the cooldown. read_to_end consumes the body
+        // so the keep-alive connection stays framed.
+        let _ = resp.body().read_to_end().await;
         let now = Instant::now();
         let mut reg = registry.lock().await;
         reg.set_service(number, ServiceType::Unknown, now);
         return Err(FetchError::HttpStatus(status.0));
     }
 
-    let mut reader = resp.body().reader();
-    let service = scan_category(&mut reader).await?;
-    // Drain the remaining body so the next request on this keep-alive
-    // connection doesn't read stale bytes as its response headers. If draining
-    // errors, propagate so the caller drops the resource and reconnects.
-    drain(&mut reader).await.map_err(|_| FetchError::Stream)?;
+    let body = resp.body().read_to_end().await.map_err(FetchError::Http)?;
+    let body_str = core::str::from_utf8(body).map_err(|_| FetchError::InvalidUtf8)?;
+
+    let (parsed, _): (JourneyResp, usize) = serde_json_core::from_str(body_str).map_err(|_| FetchError::Json)?;
+
+    let service = parsed
+        .payload
+        .stops
+        .iter()
+        .flat_map(|s| s.departures.iter().chain(s.arrivals.iter()))
+        .filter_map(|e| e.product.as_ref().and_then(|p| p.category_code))
+        .next()
+        .map(map_category_code)
+        .unwrap_or(ServiceType::Unknown);
 
     let now = Instant::now();
     {
@@ -355,106 +389,11 @@ where
     Ok(service)
 }
 
-/// Read and discard everything remaining on `reader` until EOF. Required after
-/// [`scan_category`] aborts early, so the keep-alive connection stays framed.
-async fn drain<R>(reader: &mut R) -> Result<(), R::Error>
-where
-    R: Read,
-{
-    let mut sink = [0u8; 256];
-    loop {
-        let n = reader.read(&mut sink).await?;
-        if n == 0 {
-            return Ok(());
-        }
-    }
-}
-
-/// Scan the streamed body for the first `"categoryCode":"XYZ"`. Returns the
-/// mapped [`ServiceType`] (Unknown if the field is absent or carries a code
-/// we don't track).
-async fn scan_category<R>(reader: &mut R) -> Result<ServiceType, FetchError>
-where
-    R: Read,
-    R::Error: core::fmt::Debug,
-{
-    const NEEDLE: &[u8] = b"\"categoryCode\":\"";
-    const OVERLAP: usize = NEEDLE.len() - 1;
-    // Window must be large enough to read meaningful chunks while keeping a
-    // small carry-over from the previous read so the needle (and its short
-    // value) can span chunk boundaries.
-    let mut buf = [0u8; 512];
-    let mut head = 0usize;
-    let mut total = 0usize;
-
-    loop {
-        if total >= SERVICE_SCAN_LIMIT {
-            return Ok(ServiceType::Unknown);
-        }
-        let n = reader.read(&mut buf[head..]).await.map_err(|_| FetchError::Stream)?;
-        if n == 0 {
-            return Ok(ServiceType::Unknown);
-        }
-        total += n;
-        let filled = head + n;
-
-        if let Some(pos) = find_subslice(&buf[..filled], NEEDLE) {
-            let value_start = pos + NEEDLE.len();
-            if let Some(end) = buf[value_start..filled].iter().position(|&b| b == b'"') {
-                return Ok(map_category_code(&buf[value_start..value_start + end]));
-            }
-            // Closing quote not in this chunk — shift the partial value to
-            // the start and switch to "scan for `\"`" mode.
-            let keep = filled - value_start;
-            buf.copy_within(value_start..filled, 0);
-            head = keep;
-            loop {
-                if total >= SERVICE_SCAN_LIMIT {
-                    return Ok(ServiceType::Unknown);
-                }
-                let n = reader.read(&mut buf[head..]).await.map_err(|_| FetchError::Stream)?;
-                if n == 0 {
-                    return Ok(ServiceType::Unknown);
-                }
-                total += n;
-                let filled = head + n;
-                if let Some(end) = buf[..filled].iter().position(|&b| b == b'"') {
-                    return Ok(map_category_code(&buf[..end]));
-                }
-                // Service codes are 2–5 chars; if we filled the whole
-                // buffer without seeing a quote the response is malformed.
-                if filled == buf.len() {
-                    return Ok(ServiceType::Unknown);
-                }
-                head = filled;
-            }
-        }
-
-        // Needle not found; preserve the last OVERLAP bytes so a match that
-        // straddles the chunk boundary survives the next read.
-        if filled >= OVERLAP {
-            buf.copy_within(filled - OVERLAP..filled, 0);
-            head = OVERLAP;
-        } else {
-            head = filled;
-        }
-    }
-}
-
-/// Tiny byte-substring search. The body is small enough that a naive scan
-/// (~hay·needle worst case) is cheaper than dragging in a generic algorithm.
-fn find_subslice(hay: &[u8], needle: &[u8]) -> Option<usize> {
-    if needle.is_empty() || needle.len() > hay.len() {
-        return None;
-    }
-    (0..=hay.len() - needle.len()).find(|&i| &hay[i..i + needle.len()] == needle)
-}
-
-fn map_category_code(code: &[u8]) -> ServiceType {
+fn map_category_code(code: &str) -> ServiceType {
     match code {
-        b"SPR" => ServiceType::Sprinter,
-        b"IC" => ServiceType::Intercity,
-        b"ICD" | b"ECD" => ServiceType::IntercityDirect,
+        "SPR" => ServiceType::Sprinter,
+        "IC" => ServiceType::Intercity,
+        "ICD" | "ECD" => ServiceType::IntercityDirect,
         _ => {
             log::info!("ns_api: unknown train service string {:?}", code);
             ServiceType::Unknown
