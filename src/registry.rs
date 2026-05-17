@@ -125,36 +125,43 @@ impl Registry {
         }
     }
 
-    /// Append enrichment requests to `buf` for any train whose type or
-    /// service is still unknown and whose corresponding last-attempt is
-    /// outside `cooldown`. Existing entries in `buf` are preserved — the
-    /// caller can pre-populate it (e.g., with newly-seen trains) before
-    /// calling. Stops cleanly when `buf` is full.
+    /// Append retry candidates to `t_buf` and `s_buf` for any train whose
+    /// type or service is still unknown and whose corresponding last-attempt
+    /// is outside `cooldown`. The two buffers are sized independently — each
+    /// is filled up to its own capacity, and iteration stops cleanly once
+    /// both are full. Existing entries are preserved so callers can
+    /// pre-populate (e.g., with newly-seen trains).
     ///
-    /// The two axes are independent: a train with unknown type may have a
-    /// resolved service category and vice versa, so each is checked on its
-    /// own.
-    pub fn pending_enrichment<const N: usize>(&self, buf: &mut Vec<EnrichmentRequest, N>, cooldown: Duration) {
+    /// The two axes are checked independently: a train with unknown type may
+    /// have a resolved service category and vice versa, so it can land in
+    /// one buffer, the other, or both.
+    pub fn pending_enrichment<const N: usize, const M: usize>(
+        &self,
+        t_buf: &mut Vec<u32, N>,
+        s_buf: &mut Vec<u32, M>,
+        cooldown: Duration,
+    ) {
         let now = Instant::now();
         let cooldown_s = cooldown.as_secs();
         for (k, v) in self.map.iter() {
-            if buf.len() == buf.capacity() {
+            if t_buf.len() == t_buf.capacity() && s_buf.len() == s_buf.capacity() {
                 break;
             }
             let since_seen_s = now.duration_since(v.last_seen).as_secs();
-            if v.typ == TrainType::Unknown && ready(v.last_type_attempt_ago_s, since_seen_s, cooldown_s) {
-                if buf.push(EnrichmentRequest::Type(*k)).is_err() {
-                    break;
-                }
-                if buf.len() == buf.capacity() {
-                    break;
+            if t_buf.len() < t_buf.capacity() {
+                if v.typ == TrainType::Unknown && ready(v.last_type_attempt_ago_s, since_seen_s, cooldown_s) {
+                    if t_buf.push(*k).is_err() {
+                        break;
+                    }
                 }
             }
-            if v.service == ServiceType::Unknown
-                && ready(v.last_service_attempt_ago_s, since_seen_s, cooldown_s)
-                && buf.push(EnrichmentRequest::Service(*k)).is_err()
-            {
-                break;
+            if s_buf.len() < s_buf.capacity() {
+                if v.service == ServiceType::Unknown
+                    && ready(v.last_service_attempt_ago_s, since_seen_s, cooldown_s)
+                    && s_buf.push(*k).is_err()
+                {
+                    break;
+                }
             }
         }
     }
@@ -227,14 +234,6 @@ fn bump_attempt_ago(ago_s: u16, delta_s: u64) -> u16 {
 pub enum UnknownAxis {
     Type,
     Service,
-}
-
-/// One unit of enrichment work for the ns_api task: fetch either the train
-/// type or the service category for the given ritnummer.
-#[derive(Debug, Clone, Copy)]
-pub enum EnrichmentRequest {
-    Type(u32),
-    Service(u32),
 }
 
 /// True if the cooldown for an attempt with offset `ago_s` (relative to

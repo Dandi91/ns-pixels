@@ -1,21 +1,28 @@
 //! NS API enrichment task.
 //!
-//! Drains the new-train channel and pulls additional retry candidates from
-//! [`Registry::pending_enrichment`], merging both into a single buffer of
-//! [`EnrichmentRequest`]s. Per iteration, one TLS connection is opened to
-//! `gateway.apiportal.ns.nl` and reused across every request in the buffer,
-//! amortizing the handshake cost over the whole batch.
+//! Each wake-up drains the new-train channel into a pair of pending-work
+//! buffers — one per request kind — and tops them up with retry candidates
+//! pulled from [`crate::registry::Registry::pending_enrichment`]. The two
+//! axes (train type and service category) are tracked independently so a
+//! resolved type doesn't gate a still-missing service, and vice versa; this
+//! also lets the buffers be sized to each endpoint's actual cost.
 //!
-//! Each request is one of:
+//! Per iteration, one TLS connection is opened to `gateway.apiportal.ns.nl`
+//! and reused across every request in the batch, amortizing the handshake
+//! cost. After the type batch (chunked to [`BATCH_MAX`] ids per call) comes
+//! the service batch (one request per train, since the journey endpoint
+//! takes a single train number).
 //!
-//! - **Type** — `GET /virtual-train-api/v1/trein?ids=N`, ~150 B body, parsed
-//!   as JSON.
+//! Two kinds of request:
+//!
+//! - **Type** — `GET /virtual-train-api/v1/trein?ids=N1,N2,…`, ~150 B/train,
+//!   parsed as JSON.
 //! - **Service** — `GET /reisinformatie-api/api/v2/journey?train=N`, ~30 KB
 //!   body, read fully into the HTTP buffer and deserialized with serde to
 //!   pull out the first `categoryCode`.
 //!
 //! Both kinds apply their result to the shared [`SharedRegistry`]; a cluster
-//! snapshot is published once the buffer is fully processed.
+//! snapshot is published once the whole batch is processed.
 
 use core::fmt::Write as _;
 
@@ -37,21 +44,23 @@ use serde::Deserialize;
 use crate::display;
 use crate::leak_psram_slice;
 use crate::map_mode;
-use crate::registry::{EnrichmentRequest, SharedRegistry};
+use crate::registry::{SharedRegistry};
 use crate::train::{ServiceType, TrainType};
 
 pub const QUEUE_CAPACITY: usize = 64;
-/// Total enrichment requests handled per wake-up. Each one is a single HTTPS
-/// round-trip on the shared keep-alive connection (Type requests are further
-/// batched up to [`BATCH_MAX`]).
-const BUFFER_CAP: usize = 16;
+/// Pending-work buffer sizes — picked per axis based on per-request cost.
+/// Type requests coalesce up to [`BATCH_MAX`] ids per HTTPS call, so a larger
+/// buffer is cheap. Service requests are one-per-call against the ~30 KB
+/// journey endpoint, so the buffer is kept small to bound per-wake latency.
+const TYPE_BUFFER_CAP: usize = 32;
+const SERVICE_BUFFER_CAP: usize = 4;
 /// Max train numbers per `/virtual-train-api/v1/trein?ids=…` call.
 const BATCH_MAX: usize = 8;
 /// Brief window after a wake-up to let the registry settle before sweeping.
-const COALESCE: Duration = Duration::from_millis(500);
+const COALESCE: Duration = Duration::from_millis(100);
 /// Fallback wake even if no new-train notifications arrive — picks up trains
 /// dropped from the queue under load and retries failed/missing entries.
-const SWEEP_INTERVAL: Duration = Duration::from_secs(5);
+const SWEEP_INTERVAL: Duration = Duration::from_secs(2);
 /// Pause between API calls if a previous call failed; avoids hammering the
 /// gateway when something is broken.
 const FAILURE_BACKOFF: Duration = Duration::from_secs(10);
@@ -143,57 +152,42 @@ pub async fn run(
     let dns = DnsSocket::new(stack);
     let mut rng_seed = tls_seed;
 
-    let mut buf: Vec<EnrichmentRequest, { BUFFER_CAP * 2 }> = Vec::new();
-    let mut type_batch: Vec<u32, BUFFER_CAP> = Vec::new();
-    let mut service_batch: Vec<u32, BUFFER_CAP> = Vec::new();
+    let mut type_batch: Vec<u32, TYPE_BUFFER_CAP> = Vec::new();
+    let mut service_batch: Vec<u32, SERVICE_BUFFER_CAP> = Vec::new();
 
     // One TLS session per non-empty wake-up: built right before use and
     // dropped right after. This keeps handshake amortization within a batch
-    // (BATCH_MAX type-requests + up to BUFFER_CAP service requests share
-    // one TLS connection) while avoiding idle sessions across batches.
+    // (the whole type batch plus the full service batch share one TLS
+    // connection) while avoiding idle sessions across batches.
     loop {
         // Wake on either a new-train notification (low-latency path) or the periodic sweep
         // (covers IDs dropped from a full channel and retries failed lookups).
-        let _ = select(queue.receive(), Timer::after(SWEEP_INTERVAL)).await;
+        select(queue.ready_to_receive(), Timer::after(SWEEP_INTERVAL)).await;
 
         // Brief settle window so a burst of notifications coalesces.
         Timer::after(COALESCE).await;
 
-        // Build the request buffer. New trains land here first as a (Type, Service) pair each;
+        // Build the request buffers. New trains land here first;
         // pending_enrichment then tops up the rest with retry candidates from the registry.
-        buf.clear();
-        while buf.capacity() - buf.len() >= 2 {
+        type_batch.clear();
+        service_batch.clear();
+        while type_batch.len() < type_batch.capacity() {
             match queue.try_receive() {
                 Ok(n) => {
-                    let _ = buf.push(EnrichmentRequest::Type(n));
-                    let _ = buf.push(EnrichmentRequest::Service(n));
+                    let _ = type_batch.push(n);
+                    let _ = service_batch.push(n);
                 }
                 Err(_) => break,
             }
         }
         // Only check for pending enrichment if there were no new trains.
         // Otherwise, some trains may be requested twice
-        if buf.is_empty() {
+        if type_batch.is_empty() {
             let reg = registry.lock().await;
-            reg.pending_enrichment(&mut buf, RETRY_COOLDOWN);
+            reg.pending_enrichment(&mut type_batch, &mut service_batch, RETRY_COOLDOWN);
         }
-        if buf.is_empty() {
+        if type_batch.is_empty() && service_batch.is_empty() {
             continue;
-        }
-
-        // Partition by axis so Type requests can be coalesced into batched URL calls;
-        // Service requests stay one-per-call (the journey endpoint takes a single train).
-        type_batch.clear();
-        service_batch.clear();
-        for &req in buf.iter() {
-            match req {
-                EnrichmentRequest::Type(n) => {
-                    let _ = type_batch.push(n);
-                }
-                EnrichmentRequest::Service(n) => {
-                    let _ = service_batch.push(n);
-                }
-            }
         }
 
         // Now that we have work, open a fresh TLS session and use it for
