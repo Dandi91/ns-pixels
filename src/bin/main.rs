@@ -5,6 +5,7 @@
 extern crate alloc;
 
 use embassy_executor::Spawner;
+use embassy_net::Stack;
 use embassy_net::{Runner, StackResources};
 use embassy_time::{Duration, Timer};
 use esp_alloc as _;
@@ -24,6 +25,7 @@ use ns_pixels::{
     feed, input,
     ns_api::{self, NewTrainQueue},
     registry::{Registry, SharedRegistry},
+    task_future_size,
 };
 
 esp_bootloader_esp_idf::esp_app_desc!();
@@ -132,7 +134,7 @@ async fn main(spawner: Spawner) -> ! {
     let btn_down = Input::new(peripherals.GPIO7, btn_cfg);
     spawner.spawn(input::run(btn_up, btn_down).unwrap());
 
-    // Main has nothing more to do; tasks own the work loops.
+    log_task_future_sizes();
     loop {
         Timer::after(Duration::from_secs(3600)).await;
     }
@@ -165,4 +167,31 @@ async fn connection(mut controller: WifiController<'static>) {
 #[embassy_executor::task]
 async fn net_task(mut runner: Runner<'static, Interface<'static>>) {
     runner.run().await
+}
+
+/// One-shot log of every spawned task's future size. Embassy stores each task
+/// inline in its TaskPool, so this is the same as the per-task arena cost.
+fn log_task_future_sizes() {
+    log::info!("task future sizes:");
+    let conn = task_future_size!(__connection_task, WifiController<'static>);
+    let net = task_future_size!(__net_task_task, Runner<'static, Interface<'static>>);
+    let feed = task_future_size!(
+        feed::__run_task,
+        Stack<'static>,
+        &'static SharedRegistry,
+        &'static NewTrainQueue
+    );
+    let ns_api = task_future_size!(
+        ns_api::__run_task,
+        Stack<'static>,
+        &'static SharedRegistry,
+        &'static NewTrainQueue,
+        u64
+    );
+    let input = task_future_size!(input::__run_task, Input<'static>, Input<'static>);
+    log::info!("  connection: {conn} B");
+    log::info!("  net_task:   {net} B");
+    log::info!("  feed:       {feed} B");
+    log::info!("  ns_api:     {ns_api} B");
+    log::info!("  input:      {input} B");
 }
