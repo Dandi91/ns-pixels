@@ -1,5 +1,7 @@
 [package]
+authors      = ["Aleksandr Andreev <dandi.vlg@gmail.com>"]
 edition      = "2024"
+license      = "MIT OR Apache-2.0"
 name         = "ns-pixels"
 rust-version = "1.88"
 version      = "0.1.0"
@@ -9,83 +11,64 @@ name = "ns-pixels"
 path = "./src/bin/main.rs"
 
 [dependencies]
-esp-hal = { version = "~1.1.0", features = ["esp32s3", "log-04", "unstable"] }
-
-esp-rtos = { version = "0.3.0", features = [
-  "embassy",
-  "esp-alloc",
-  "esp-radio",
-  "esp32s3",
-  "log-04",
-] }
-
+# --- esp-hal and ESP32-S3 runtime ---
+esp-hal                = { version = "~1.1.0", features = ["esp32s3", "log-04", "unstable"] }
+esp-rtos               = { version = "0.3.0", features = ["embassy", "esp-alloc", "esp-radio", "esp32s3", "log-04"] }
+esp-radio              = { version = "0.18.0", features = ["esp-alloc", "esp32s3", "log-04", "unstable", "wifi"] }
+esp-alloc              = { version = "0.10.0", features = ["nightly"] } # `nightly` enables Box::new_in for PSRAM allocations
+esp-backtrace          = { version = "0.19.0", features = ["esp32s3", "panic-handler", "println"] }
 esp-bootloader-esp-idf = { version = "0.5.0", features = ["esp32s3", "log-04"] }
-log                    = "0.4.27"
+esp-println            = { version = "0.17.0", features = ["esp32s3", "log-04"] }
+esp-storage            = { version = "0.9", features = ["esp32s3"] }
 
-embassy-net = { version = "0.9.1", features = [
-  "dhcpv4",
-  "log",
-  "medium-ethernet",
-  "tcp",
-  "dns",
-] }
-embedded-io-async = "0.7.0"
-esp-alloc = { version = "0.10.0", features = ["nightly"] }
-esp-backtrace = { version = "0.19.0", features = [
-  "esp32s3",
-  "panic-handler",
-  "println",
-] }
-esp-println = { version = "0.17.0", features = ["esp32s3", "log-04"] }
-# for more networking protocol support see https://crates.io/crates/edge-net
-embassy-executor = { version = "0.10.0", features = ["log"] }
-embassy-time = { version = "0.5.0", features = ["log"] }
-esp-radio = { version = "0.18.0", features = [
-  "esp-alloc",
-  "esp32s3",
-  "log-04",
-  "unstable",
-  "wifi",
-] }
-static_cell      = "2.1.1"
-# Crates.io's reqwless 0.14 transitively requires embedded-tls 0.18 + a
-# broken `der = 0.8.0-rc.2`. PR #133 (open) updates reqwless to embedded-tls
-# 0.19. We pin to that branch and patch embedded-tls to git master to satisfy
-# its `version = "0.19"` requirement.
-# Vendored fork of nerwalt/reqwless#update-to-embedded-tls-0.19 with one
-# extra line: `TlsConfig::enable_rsa_signatures()` so embedded-tls advertises
-# RSA sig algorithms during the handshake. Without it, RSA-only servers
-# (e.g. Azure API Management, where the NS gateway lives) reject with
-# HandshakeFailure since the default config only offers ECDSA P-256.
-reqwless = { path = "vendor/reqwless", default-features = false, features = ["embedded-tls"] }
-serde = { version = "1", default-features = false, features = ["derive"] }
-serde-json-core = "0.6"
-miniz_oxide = { version = "0.9.1", default-features = false, features = ["with-alloc"] }
-esp-hub75 = { version = "0.11.0", features = ["esp32s3", "iram"] }
-embedded-graphics = { version = "0.8", default-features = false }
-xmlparser = { version = "0.13.6", default-features = false }
-heapless = "0.8"
-embassy-sync = "0.8.0"
-embassy-futures = "0.1"
+# --- Embassy async runtime + abstractions ---
+embassy-executor     = { version = "0.10.0", features = ["log"] }
+embassy-time         = { version = "0.5.0", features = ["log"] }
+embassy-sync         = "0.8.0"
+embassy-futures      = "0.1"
 embassy-embedded-hal = "0.6"
-esp-storage = { version = "0.9", features = ["esp32s3"] }
-sequential-storage = "7"
 
-# Crates.io's reqwless 0.14 transitively requires embedded-tls 0.18 + a
-# broken `der = 0.8.0-rc.2`. PR #133 updates reqwless to embedded-tls 0.19.
-# embedded-tls 0.19 isn't on crates.io yet, so patch to git master.
+# --- Networking: wifi/TCP stack + HTTPS client ---
+embassy-net       = { version = "0.9.1", features = ["dhcpv4", "log", "medium-ethernet", "tcp", "dns"] }
+embedded-io-async = "0.7.0"
+# Vendored fork of nerwalt/reqwless#update-to-embedded-tls-0.19 with one extra
+# line: `TlsConfig::enable_rsa_signatures()` so embedded-tls advertises RSA sig
+# algorithms during the handshake. Without it, RSA-only servers (e.g., Azure API
+# Management, where the NS gateway lives) reject with HandshakeFailure since
+# the default config only offers ECDSA P-256.
+reqwless = { path = "vendor/reqwless", default-features = false, features = ["embedded-tls"] }
+
+# --- Display ---
+esp-hub75         = { version = "0.11.0", features = ["esp32s3", "iram"] }
+embedded-graphics = { version = "0.8", default-features = false } # used only for `Point`, which `esp-hub75`'s framebuffer API takes
+
+# --- Parsing / serialization ---
+serde           = { version = "1", default-features = false, features = ["derive"] }
+serde-json-core = "0.6"
+xmlparser       = { version = "0.13.6", default-features = false }
+miniz_oxide     = { version = "0.9.1", default-features = false, features = ["with-alloc"] } # gzip inflate for the NDOV feed
+
+# --- Storage ---
+sequential-storage = "7" # wear-leveled K/V on top of esp-storage's NorFlash
+
+# --- Misc ---
+log         = "0.4.27"
+heapless    = "0.8"
+static_cell = "2.1.1"
+
 [patch.crates-io]
+# reqwless's vendored fork tracks embedded-tls 0.19, which isn't on crates.io
+# yet — patch to git master so the version requirement resolves.
 embedded-tls = { git = "https://github.com/drogue-iot/embedded-tls" }
 
-
-# For fine tuning these settings, please refer to https://doc.rust-lang.org/cargo/reference/profiles.html
+# Profile tuning: https://doc.rust-lang.org/cargo/reference/profiles.html
 [profile.dev]
-# The default debug profile is too slow and too big for resource-constrained devices.
-# Always build with some optimizations enabled.
+# Default debug profile is too slow and too big for resource-constrained
+# devices; keep some optimization even in dev builds.
 opt-level = "s"
 
 [profile.release]
-codegen-units = 1     # LLVM can perform better optimizations using a single thread
-debug         = 2     # prefer slower builds but better debugging experience
+codegen-units = 1     # single-thread LLVM lets it optimize more aggressively
+debug         = 2     # keep full debug info; useful for esp-backtrace decoding
 lto           = 'fat'
 opt-level     = 's'
