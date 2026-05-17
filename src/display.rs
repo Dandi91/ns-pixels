@@ -296,6 +296,10 @@ pub fn config() -> DisplayConfig {
     CONFIG.lock(|c| c.get())
 }
 
+pub fn set_config(cfg: DisplayConfig) {
+    CONFIG.lock(|c| c.set(cfg));
+}
+
 pub fn update_config(f: impl FnOnce(DisplayConfig) -> DisplayConfig) -> DisplayConfig {
     CONFIG.lock(|c| {
         let next = f(c.get());

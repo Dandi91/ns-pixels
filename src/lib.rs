@@ -8,6 +8,7 @@ pub mod display;
 pub mod feed;
 pub mod input;
 pub mod ns_api;
+pub mod persist;
 pub mod projection;
 pub mod registry;
 pub mod train;

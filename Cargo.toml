@@ -58,7 +58,6 @@ static_cell      = "2.1.1"
 # (e.g. Azure API Management, where the NS gateway lives) reject with
 # HandshakeFailure since the default config only offers ECDSA P-256.
 reqwless = { path = "vendor/reqwless", default-features = false, features = ["embedded-tls"] }
-embedded-nal-async = "0.9"
 serde = { version = "1", default-features = false, features = ["derive"] }
 serde-json-core = "0.6"
 miniz_oxide = { version = "0.9.1", default-features = false, features = ["with-alloc"] }
@@ -68,6 +67,9 @@ xmlparser = { version = "0.13.6", default-features = false }
 heapless = "0.8"
 embassy-sync = "0.8.0"
 embassy-futures = "0.1"
+embassy-embedded-hal = "0.6"
+esp-storage = { version = "0.9", features = ["esp32s3"] }
+sequential-storage = "7"
 
 # Crates.io's reqwless 0.14 transitively requires embedded-tls 0.18 + a
 # broken `der = 0.8.0-rc.2`. PR #133 updates reqwless to embedded-tls 0.19.

@@ -24,6 +24,7 @@ use ns_pixels::{
     display::{self, DisplayPeripherals},
     feed, input,
     ns_api::{self, NewTrainQueue},
+    persist,
     registry::{Registry, SharedRegistry},
     task_future_size,
 };
@@ -83,6 +84,13 @@ async fn main(spawner: Spawner) -> ! {
 
     let registry: &'static SharedRegistry = mk_static!(SharedRegistry, Registry::new().into());
     let queue: &'static NewTrainQueue = mk_static!(NewTrainQueue, NewTrainQueue::new());
+
+    let mut config_store = persist::ConfigStore::new(peripherals.FLASH);
+    if let Some(cfg) = config_store.load().await {
+        log::info!("persist: loaded {:?}", cfg);
+        display::set_config(cfg);
+    }
+    spawner.spawn(persist::run(config_store).unwrap());
 
     display::start(
         display_peripherals,
