@@ -15,8 +15,9 @@ use esp_println::println;
 
 use crate::decompress::Decompressor;
 use crate::display;
+use crate::map_mode;
 use crate::ns_api::NewTrainQueue;
-use crate::projection::wgs84_to_matrix;
+use crate::projection::wgs84_to_canvas;
 use crate::registry::{SharedRegistry, UnknownAxis};
 use crate::xml_parser::{self, Train};
 use crate::{leak_psram_slice, zmq};
@@ -110,7 +111,7 @@ pub async fn run(stack: Stack<'static>, registry: &'static SharedRegistry, queue
                 evicted = reg.evict_older_than(cutoff);
             }
             for t in &trains {
-                let pixel = wgs84_to_matrix(t.lat, t.lon);
+                let pixel = wgs84_to_canvas(t.lat, t.lon);
                 if reg.upsert(t.number, pixel, now) {
                     new_count += 1;
                     if queue.try_send(t.number).is_err() {
@@ -119,7 +120,7 @@ pub async fn run(stack: Stack<'static>, registry: &'static SharedRegistry, queue
                 }
             }
             if let Some(buf) = snapshot.as_deref_mut() {
-                reg.rebuild_clusters_into(buf);
+                reg.rebuild_clusters_into(buf, map_mode::current());
             }
             registry_len = reg.len();
             unknowns = reg.unknown_count();

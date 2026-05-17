@@ -36,6 +36,7 @@ use serde::Deserialize;
 
 use crate::display;
 use crate::leak_psram_slice;
+use crate::map_mode;
 use crate::registry::{EnrichmentRequest, SharedRegistry};
 use crate::train::{ServiceType, TrainType};
 
@@ -245,7 +246,7 @@ async fn publish_snapshot(registry: &SharedRegistry) {
     if let Some(buf) = display::try_take_free_clusters() {
         {
             let reg = registry.lock().await;
-            reg.rebuild_clusters_into(buf);
+            reg.rebuild_clusters_into(buf, map_mode::current());
         }
         display::publish_clusters(buf);
     }

@@ -109,13 +109,3 @@ pub struct PixelData {
     pub types: u8,
     pub services: u8,
 }
-
-impl From<&TrainState> for PixelData {
-    fn from(state: &TrainState) -> Self {
-        Self {
-            coord_key: state.pixel.as_u16(),
-            types: state.typ.as_bit(),
-            services: state.service.as_bit(),
-        }
-    }
-}

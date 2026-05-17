@@ -22,7 +22,7 @@ use esp_println::println;
 use esp_radio::wifi::{Config, ControllerConfig, Interface, WifiController, sta::StationConfig};
 use ns_pixels::{
     display::{self, DisplayPeripherals},
-    feed, input,
+    feed, input, map_mode,
     ns_api::{self, NewTrainQueue},
     persist,
     registry::{Registry, SharedRegistry},
@@ -141,6 +141,7 @@ async fn main(spawner: Spawner) -> ! {
     let btn_up = Input::new(peripherals.GPIO6, btn_cfg);
     let btn_down = Input::new(peripherals.GPIO7, btn_cfg);
     spawner.spawn(input::run(btn_up, btn_down).unwrap());
+    spawner.spawn(map_mode::run(registry).unwrap());
 
     log_task_future_sizes();
     loop {

@@ -8,6 +8,7 @@ use embassy_sync::mutex::Mutex;
 use embassy_time::{Duration, Instant};
 use heapless::{FnvIndexMap, Vec};
 
+use crate::map_mode::{MapMode, canvas_to_display};
 use crate::projection::PixelCoord;
 use crate::train::{PixelData, ServiceType, TrainState, TrainType};
 
@@ -163,14 +164,20 @@ impl Registry {
     /// collapses adjacent same-pixel entries by OR-ing their type bitmasks.
     /// Caller owns the buffer so the display task can read it without holding
     /// the registry lock.
-    pub fn rebuild_clusters_into(&self, out: &mut Vec<PixelData, MAX_TRAINS>) {
+    pub fn rebuild_clusters_into(&self, out: &mut Vec<PixelData, MAX_TRAINS>, mode: MapMode) {
         out.clear();
         for state in self.map.values() {
-            if !state.pixel.is_on_screen() {
+            let Some(display) = canvas_to_display(state.pixel, mode) else {
                 continue;
-            }
+            };
             // SAFETY: at most MAX_TRAINS entries in the map, so all fit.
-            unsafe { out.push_unchecked(state.into()) };
+            unsafe {
+                out.push_unchecked(PixelData {
+                    coord_key: display.as_u16(),
+                    types: state.typ.as_bit(),
+                    services: state.service.as_bit(),
+                })
+            };
         }
         out.sort_unstable_by_key(|e| e.coord_key);
         // Collapse runs of entries sharing a pixel by OR-ing their type

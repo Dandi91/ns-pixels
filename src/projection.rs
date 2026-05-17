@@ -1,6 +1,18 @@
-/// Pixel coordinate on the 64×64 LED matrix. `x`/`y` may exceed `WIDTH`/
-/// `HEIGHT` when the train is outside the displayed bounding box — callers
-/// should filter with `is_on_screen`.
+//! Geographic projection.
+//!
+//! Trains are stored as **canvas-pixel** coordinates: a single 224×224 grid at
+//! 1250 m/pixel covering the same NL bounding box as before. The display is
+//! 64×64; each map mode projects from canvas pixels to display pixels with a
+//! simple linear transform — see [`crate::map_mode::MapMode`] and the
+//! per-mode helpers in that module.
+//!
+//! Keeping coords at canvas resolution lets us avoid re-running the WGS84→RD
+//! transform on every snapshot rebuild while still supporting modes that
+//! zoom into a sub-rectangle of the country.
+
+/// Canvas-pixel coordinate (0..[`CANVAS_SIDE`]). Values at or above the
+/// canvas size are off-canvas sentinels (e.g. trains way outside NL); filter
+/// with [`PixelCoord::is_on_canvas`].
 #[derive(Debug, Clone, Copy)]
 pub struct PixelCoord {
     pub x: u8,
@@ -8,8 +20,8 @@ pub struct PixelCoord {
 }
 
 impl PixelCoord {
-    pub fn is_on_screen(&self) -> bool {
-        self.x < WIDTH && self.y < HEIGHT
+    pub fn is_on_canvas(&self) -> bool {
+        self.x < CANVAS_SIDE && self.y < CANVAS_SIDE
     }
 
     pub fn as_u16(&self) -> u16 {
@@ -17,21 +29,25 @@ impl PixelCoord {
     }
 }
 
-pub const WIDTH: u8 = 64;
-pub const HEIGHT: u8 = 64;
+/// One side of the virtual canvas, in pixels. 280 km / 1250 m = 224.
+pub const CANVAS_SIDE: u8 = 224;
+/// Display dimensions; each map mode maps a sub-region of the canvas onto
+/// this 64×64 grid.
+pub const DISPLAY_SIDE: u8 = 64;
 
 // RD bounding box covering the Netherlands; matches the Python reference.
 const X_MIN: f32 = 0.0;
 const Y_MIN: f32 = 307_500.0;
-const M_PER_PIXEL: f32 = 4_375.0; // 280 km / 64 px
+const M_PER_CANVAS_PIXEL: f32 = 1_250.0;
+const CANVAS_SIDE_F: f32 = CANVAS_SIDE as f32;
 
-/// Project a WGS-84 (lat, lon) pair onto the 64×64 LED matrix.
+/// Project a WGS-84 (lat, lon) pair onto the 224×224 canvas grid.
 ///
-/// Internally computes RD-new coordinates (Amersfoort-centred), then maps
-/// them to pixel space using the same bounding box and Y-flip as the Python
-/// reference. The result is saturated to `u8`, so off-screen trains land on
-/// the edges; use `PixelCoord::is_on_screen` to discard them.
-pub fn wgs84_to_matrix(lat: f32, lon: f32) -> PixelCoord {
+/// Internally computes RD-new coordinates (Amersfoort-centred), then scales
+/// to canvas pixels with the same Y-flip as the display (north at the top).
+/// Off-canvas results saturate above [`CANVAS_SIDE`]; filter with
+/// [`PixelCoord::is_on_canvas`].
+pub fn wgs84_to_canvas(lat: f32, lon: f32) -> PixelCoord {
     // Reference center (Amersfoort)
     const PHI0: f32 = 52.15517440;
     const LAM0: f32 = 5.38720621;
@@ -59,11 +75,11 @@ pub fn wgs84_to_matrix(lat: f32, lon: f32) -> PixelCoord {
     y += d_lam * (0.433 - 0.032 * d_phi);
     y += (l2 * l2) * (0.092 - 0.054 * d_phi); // l^4
 
-    // RD → pixel space; flip Y so south of NL is at the bottom of the display.
-    let px = (x - X_MIN) / M_PER_PIXEL;
-    let py = (y - Y_MIN) / M_PER_PIXEL;
+    // RD → canvas-pixel space; flip Y so south of NL is at the bottom.
+    let px = (x - X_MIN) / M_PER_CANVAS_PIXEL;
+    let py = (y - Y_MIN) / M_PER_CANVAS_PIXEL;
     let pixel_x = sat_u8(px);
-    let pixel_y = sat_u8(HEIGHT as f32 - py);
+    let pixel_y = sat_u8(CANVAS_SIDE_F - py);
     PixelCoord { x: pixel_x, y: pixel_y }
 }
 

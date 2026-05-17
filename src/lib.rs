@@ -7,6 +7,7 @@ pub mod decompress;
 pub mod display;
 pub mod feed;
 pub mod input;
+pub mod map_mode;
 pub mod ns_api;
 pub mod persist;
 pub mod projection;
