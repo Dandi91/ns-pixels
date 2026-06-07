@@ -281,22 +281,17 @@ pub struct DisplayConfig {
 }
 
 impl DisplayConfig {
-    pub const fn new() -> Self {
-        Self {
-            viz: VizMode::PerCluster,
-            col: ColorMode::ByType,
-        }
+    pub const fn new(viz: VizMode, col: ColorMode) -> Self {
+        Self { viz, col }
     }
-}
 
-impl Default for DisplayConfig {
-    fn default() -> Self {
-        Self::new()
+    pub const fn default() -> Self {
+        Self::new(VizMode::PerCluster, ColorMode::ByType)
     }
 }
 
 static CONFIG: BlockingMutex<CriticalSectionRawMutex, Cell<DisplayConfig>> =
-    BlockingMutex::new(Cell::new(DisplayConfig::new()));
+    BlockingMutex::new(Cell::new(DisplayConfig::default()));
 
 pub fn config() -> DisplayConfig {
     CONFIG.lock(|c| c.get())

@@ -57,7 +57,7 @@ impl Value<'_> for DisplayConfig {
         }
         let viz = viz_from_u8(buffer[0]).ok_or(SerializationError::InvalidFormat)?;
         let col = col_from_u8(buffer[1]).ok_or(SerializationError::InvalidFormat)?;
-        Ok((DisplayConfig { viz, col }, 2))
+        Ok((DisplayConfig::new(viz, col), 2))
     }
 }
 

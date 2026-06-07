@@ -35,7 +35,7 @@ pub async fn run(mut up: Input<'static>, mut down: Input<'static>) {
                 match select(up.wait_for_high(), Timer::after(LONG_PRESS)).await {
                     Either::First(_) => {
                         // Released before the threshold — short press: cycle viz.
-                        let cfg = update_config(|c| DisplayConfig { viz: c.viz.next(), ..c });
+                        let cfg = update_config(|c| DisplayConfig::new(c.viz.next(), c.col));
                         println!("input: UP short -> viz {:?}", cfg.viz);
                         persist::request_save(cfg);
                     }
@@ -50,7 +50,7 @@ pub async fn run(mut up: Input<'static>, mut down: Input<'static>) {
                 }
             }
             Either::Second(_) if down.is_low() => {
-                let cfg = update_config(|c| DisplayConfig { col: c.col.next(), ..c });
+                let cfg = update_config(|c| DisplayConfig::new(c.viz, c.col.next()));
                 println!("input: DOWN -> color {:?}", cfg.col);
                 persist::request_save(cfg);
                 down.wait_for_high().await;
