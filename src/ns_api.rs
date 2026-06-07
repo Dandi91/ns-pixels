@@ -44,7 +44,7 @@ use serde::Deserialize;
 use crate::display;
 use crate::leak_psram_slice;
 use crate::map_mode;
-use crate::registry::{SharedRegistry};
+use crate::registry::SharedRegistry;
 use crate::train::{ServiceType, TrainType};
 
 pub const QUEUE_CAPACITY: usize = 64;

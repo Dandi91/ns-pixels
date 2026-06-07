@@ -289,6 +289,12 @@ impl DisplayConfig {
     }
 }
 
+impl Default for DisplayConfig {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 static CONFIG: BlockingMutex<CriticalSectionRawMutex, Cell<DisplayConfig>> =
     BlockingMutex::new(Cell::new(DisplayConfig::new()));
 

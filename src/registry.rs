@@ -89,10 +89,8 @@ impl Registry {
     pub fn evict_older_than(&mut self, cutoff: Instant) -> usize {
         let mut to_remove: Vec<u32, EVICT_BATCH> = Vec::new();
         for (k, v) in self.map.iter() {
-            if v.last_seen < cutoff {
-                if to_remove.push(*k).is_err() {
-                    break;
-                }
+            if v.last_seen < cutoff && to_remove.push(*k).is_err() {
+                break;
             }
         }
         for k in &to_remove {
@@ -148,20 +146,19 @@ impl Registry {
                 break;
             }
             let since_seen_s = now.duration_since(v.last_seen).as_secs();
-            if t_buf.len() < t_buf.capacity() {
-                if v.typ == TrainType::Unknown && ready(v.last_type_attempt_ago_s, since_seen_s, cooldown_s) {
-                    if t_buf.push(*k).is_err() {
-                        break;
-                    }
-                }
+            if t_buf.len() < t_buf.capacity()
+                && v.typ == TrainType::Unknown
+                && ready(v.last_type_attempt_ago_s, since_seen_s, cooldown_s)
+                && t_buf.push(*k).is_err()
+            {
+                break;
             }
-            if s_buf.len() < s_buf.capacity() {
-                if v.service == ServiceType::Unknown
-                    && ready(v.last_service_attempt_ago_s, since_seen_s, cooldown_s)
-                    && s_buf.push(*k).is_err()
-                {
-                    break;
-                }
+            if s_buf.len() < s_buf.capacity()
+                && v.service == ServiceType::Unknown
+                && ready(v.last_service_attempt_ago_s, since_seen_s, cooldown_s)
+                && s_buf.push(*k).is_err()
+            {
+                break;
             }
         }
     }

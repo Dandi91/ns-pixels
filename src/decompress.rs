@@ -50,7 +50,7 @@ impl Decompressor {
             }
             let last = input.is_empty();
             let flush = if last { MZFlush::Finish } else { MZFlush::None };
-            let res = inflate(&mut *self.state, input, &mut self.buf[written..], flush);
+            let res = inflate(&mut self.state, input, &mut self.buf[written..], flush);
             input = &input[res.bytes_consumed..];
             written += res.bytes_written;
             match res.status {
