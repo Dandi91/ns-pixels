@@ -3,27 +3,26 @@
 ![ns-pixels in action](media/vid.webp)
 
 A live train map for the Netherlands rendered on a 64×64 RGB LED matrix. Every
-train currently running on the NS network shows up as a single colored pixel
-that drifts across the country in real time. Colors encode either the rolling
-stock type (SLT, VIRM, ICNG, …) or the service category (Sprinter, Intercity,
-Intercity Direct).
+train currently running on the network of NS — the main Dutch passenger railway
+operator — shows up as a single colored pixel that drifts across the country in
+real time. Colors encode either the rolling stock type (SLT, VIRM, ICNG, …) or
+the service category (Sprinter, Intercity, Intercity Direct).
 
-Two map views auto-cycle every 5 minutes: the full country, and 80 km square
-zoom on the Randstad (Den Haag in the west, just east of Amersfoort, just south
-of Zaandam, down past Dordrecht) where the train density is too high to be
-legible at the country-wide scale.
+Two map views auto-cycle every 5 minutes: the full country, and an 80 km square
+zoom on the Randstad where the train density is too high to be legible at the
+country-wide scale.
 
 ## Hardware
 
 - **64×64 RGB LED matrix, 2.5 mm pitch** —
   [Adafruit 3649](https://www.adafruit.com/product/3649). Any HUB75 64×64
-  panel with the same pinout works; the 2.5 mm pitch gives a ~16 cm square
-  display that's the right size for a wall-mounted map of NL.
+  panel with the same pinout works; the 2.5 mm pitch gives a ~16 cm square display.
 - **Adafruit Matrix Portal S3** —
   [Adafruit 5778](https://www.adafruit.com/product/5778). An ESP32-S3 board
   that plugs straight into the IDC connector on the back of the panel,
   wires up the HUB75 signals, and exposes spare GPIOs on a side header.
   Includes 8 MB flash and 2 MB PSRAM, both of which the firmware uses.
+
 A typical view has only a few hundred LEDs lit at any moment, so total draw
 stays under 500 mA — the Matrix Portal can run both itself and the panel
 straight off its USB-C input. No separate panel PSU needed.
@@ -32,7 +31,7 @@ The Matrix Portal S3's pinout matches the firmware's pin assignments out of
 the box. If you wire up a generic ESP32-S3 board to a HUB75 panel yourself,
 look at `src/bin/main.rs` for the expected GPIOs (R1/G1/B1/R2/G2/B2, address
 lines A–E, CLK, LAT, OE) and adjust to taste. Don't forget about the level shifters
-between 3.3V ESP and 5V HUB75!
+between 3.3 V ESP and 5 V HUB75!
 
 The two user buttons (UP / DOWN) are the ones built into the Matrix Portal board,
 on GPIO6 and GPIO7 — these can be remapped as well, see `src/bin/main.rs`.
@@ -41,9 +40,7 @@ on GPIO6 and GPIO7 — these can be remapped as well, see `src/bin/main.rs`.
 
 - **Train positions** come from [NDOV Loket](https://www.ndovloket.nl/)'s public ZMQ feed
   (`pubsub.besteffort.ndovloket.nl:7664`, topic `/RIG/NStreinpositiesInterface5`).
-  The board subscribes directly, decompresses the gzipped XML payload,
-  and pushes each train's (lat, lon, ritnummer) into an in-memory registry.
-  No registration needed.
+  The board subscribes directly, no registration needed.
 - **Train type and service category** come from the
   [NS Public Travel Information API](https://apiportal.ns.nl/) (the
   `virtual-train-api` and `reisinformatie-api` endpoints). You need a free
@@ -55,29 +52,33 @@ This is a no-std Rust project targeting `xtensa-esp32s3-none-elf`. You need:
 
 - A working **ESP-RS toolchain** — the easiest path is
   [`espup`](https://github.com/esp-rs/espup):
-  ```
+  ```sh
   cargo install espup
   espup install
   source ~/export-esp.sh
   ```
 - **`espflash`** for flashing and serial monitoring:
-  ```
+  ```sh
   cargo install espflash
   ```
 
-Set the required environment variables (the build pulls them in via
-`env!()`):
+The build pulls a few values in at compile time via `env!()`. These live in
+`.cargo/config.local.toml`, which is git-ignored. `.cargo/config.toml` includes
+it via its `include` key, so copy the template and fill it in:
 
-```
-SSID=<your wifi ssid>
-PASSWORD=<your wifi password>
-NS_API_KEY=<your NS API portal subscription key>
+```sh
+cp .cargo/config.local.toml.example .cargo/config.local.toml
 ```
 
-The repo's `.cargo/config.toml` is the canonical place for these on a
-personal device. Then:
-
+```toml
+SSID = "<your wifi SSID>"
+PASSWORD = "<your wifi password>"
+NS_API_KEY = "<your NS API portal subscription key>"
 ```
+
+Then:
+
+```sh
 cargo run --release
 ```
 
@@ -92,8 +93,7 @@ two as the NS API calls complete.
 - **UP button (short press)** — cycle the visualization mode (how the color
   of a multi-train pixel is animated).
 - **UP button (long press, ~1 s)** — switch between the full-NL map and the
-  Randstad zoom. Not persisted; the device starts in full-NL mode after a
-  reboot.
+  Randstad zoom. Not persisted; the device starts in full-NL mode after a reboot.
 - **DOWN button** — toggle between coloring by rolling stock type and
   coloring by service category.
 

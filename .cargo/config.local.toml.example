@@ -1,0 +1,5 @@
+[env]
+# WiFi credentials and NS API key (consumed at compile time via env!())
+SSID = "your-wifi-ssid"
+PASSWORD = "your-wifi-password"
+NS_API_KEY = "your-ns-api-key"

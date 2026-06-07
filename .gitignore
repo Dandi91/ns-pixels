@@ -24,6 +24,6 @@ target/
 # Ignore .DS_Store file in mac
 **/.DS_Store
 
-# Local build config
-.cargo
+# Local build config (secrets + machine-specific paths)
+.cargo/config.local.toml
 .claude
