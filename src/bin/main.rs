@@ -13,6 +13,7 @@ use esp_backtrace as _;
 use esp_hal::{
     clock::CpuClock,
     gpio::{Input, InputConfig, Pin, Pull},
+    i2c,
     interrupt::software::SoftwareInterruptControl,
     ram,
     rng::Rng,
@@ -21,6 +22,7 @@ use esp_hal::{
 use esp_println::println;
 use esp_radio::wifi::{Config, ControllerConfig, Interface, WifiController, sta::StationConfig};
 use ns_pixels::{
+    accel,
     display::{self, DisplayPeripherals},
     feed, input, map_mode,
     ns_api::{self, NewTrainQueue},
@@ -61,6 +63,23 @@ async fn main(spawner: Spawner) -> ! {
     let sw_int = SoftwareInterruptControl::new(peripherals.SW_INTERRUPT);
     esp_rtos::start(timg0.timer0, sw_int.software_interrupt0);
 
+    // Non-volatile config in FLASH
+    let mut config_store = persist::ConfigStore::new(peripherals.FLASH);
+    if let Some(cfg) = config_store.load().await {
+        log::info!("persist: loaded {:?}", cfg);
+        display::set_config(cfg);
+    }
+    spawner.spawn(persist::run(config_store).unwrap());
+
+    // Accelerometer to auto-rotate the screen
+    let i2c_config = i2c::master::Config::default();
+    let i2c = i2c::master::I2c::new(peripherals.I2C0, i2c_config)
+        .unwrap()
+        .with_sda(peripherals.GPIO16)
+        .with_scl(peripherals.GPIO17)
+        .into_async();
+    spawner.spawn(accel::run(i2c).unwrap());
+
     // Bring up the LED matrix on the second core. Pin assignments mirror the
     // esp-hub75 lcd_cam_bp example; adjust if the board's wiring differs.
     let display_peripherals = DisplayPeripherals {
@@ -81,17 +100,6 @@ async fn main(spawner: Spawner) -> ! {
         clock: peripherals.GPIO2.degrade(),
         latch: peripherals.GPIO47.degrade(),
     };
-
-    let registry: &'static SharedRegistry = mk_static!(SharedRegistry, Registry::new().into());
-    let queue: &'static NewTrainQueue = mk_static!(NewTrainQueue, NewTrainQueue::new());
-
-    let mut config_store = persist::ConfigStore::new(peripherals.FLASH);
-    if let Some(cfg) = config_store.load().await {
-        log::info!("persist: loaded {:?}", cfg);
-        display::set_config(cfg);
-    }
-    spawner.spawn(persist::run(config_store).unwrap());
-
     display::start(
         display_peripherals,
         peripherals.CPU_CTRL,
@@ -99,8 +107,8 @@ async fn main(spawner: Spawner) -> ! {
         sw_int.software_interrupt2,
     );
 
+    // Wi-Fi radio
     let station_config = Config::Station(StationConfig::default().with_ssid(SSID).with_password(PASSWORD.into()));
-
     println!("Starting wifi");
     let (controller, interfaces) = esp_radio::wifi::new(
         peripherals.WIFI,
@@ -109,38 +117,35 @@ async fn main(spawner: Spawner) -> ! {
     .unwrap();
     println!("Wifi configured and started!");
 
-    let wifi_interface = interfaces.station;
-
-    let config = embassy_net::Config::dhcpv4(Default::default());
-
+    // Network stack
     let rng = Rng::new();
     let seed = (rng.random() as u64) << 32 | rng.random() as u64;
-
-    // Init network stack
     let (stack, runner) = embassy_net::new(
-        wifi_interface,
-        config,
+        interfaces.station,
+        embassy_net::Config::dhcpv4(Default::default()),
         mk_static!(StackResources<4>, StackResources::<4>::new()),
         seed,
     );
-
     spawner.spawn(connection(controller).unwrap());
     spawner.spawn(net_task(runner).unwrap());
-
     stack.wait_config_up().await;
-
     if let Some(config) = stack.config_v4() {
         println!("Got IP: {}", config.address);
     }
 
+    // Data API tasks
+    let registry: &'static SharedRegistry = mk_static!(SharedRegistry, Registry::new().into());
+    let queue: &'static NewTrainQueue = mk_static!(NewTrainQueue, NewTrainQueue::new());
     spawner.spawn(feed::run(stack, registry, queue).unwrap());
     spawner.spawn(ns_api::run(stack, registry, queue, seed).unwrap());
 
-    // Buttons are NO to GND with internal pull-up — idle high, pressed low.
+    // Input task. Buttons are NO to GND with internal pull-up — idle high, pressed low.
     let btn_cfg = InputConfig::default().with_pull(Pull::Up);
     let btn_up = Input::new(peripherals.GPIO6, btn_cfg);
     let btn_down = Input::new(peripherals.GPIO7, btn_cfg);
     spawner.spawn(input::run(btn_up, btn_down).unwrap());
+
+    // Timed map mode switch
     spawner.spawn(map_mode::run(registry).unwrap());
 
     log_task_future_sizes();

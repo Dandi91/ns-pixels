@@ -33,6 +33,7 @@ use esp_hub75::{
 use esp_println::println;
 use esp_rtos::embassy::{Executor, InterruptExecutor};
 
+use crate::accel::{Direction, get_direction};
 use crate::registry::MAX_TRAINS;
 use crate::train::{PixelData, ServiceType, TrainType};
 use heapless::Vec;
@@ -154,12 +155,19 @@ async fn display_task(
     println!("display_task: starting!");
     let mut count = 0u32;
     let mut start = Instant::now();
+    let mut direction = Direction::default();
 
     loop {
         if let Some(new) = FRESH_CLUSTERS.try_take() {
             let old = core::mem::replace(&mut clusters, new);
             FREE_CLUSTERS.signal(old);
+            direction = Direction::default();
         }
+
+        let new_direction = get_direction();
+        rotate(clusters, direction, new_direction);
+        direction = new_direction;
+
         fb.erase();
         draw_trains(fb, clusters);
 
@@ -378,6 +386,40 @@ fn axis_for(mode: ColorMode) -> Axis {
             active: ACTIVE_SERVICE_BITS,
         },
     }
+}
+
+fn rotate(cluster: &mut ClusterVec, from_dir: Direction, to_dir: Direction) {
+    static FLIPPED: fn(u16) -> u16 = |c| ((64 << 8) | 64) - c;
+
+    if from_dir == to_dir {
+        return;
+    }
+
+    let transform = match (from_dir, to_dir) {
+        // Axis flip
+        (Direction::XUp, Direction::XDown)
+        | (Direction::XDown, Direction::XUp)
+        | (Direction::YUp, Direction::YDown)
+        | (Direction::YDown, Direction::YUp) => FLIPPED,
+        // CCW rotation
+        (Direction::XUp, Direction::YUp)
+        | (Direction::YUp, Direction::XDown)
+        | (Direction::XDown, Direction::YDown)
+        | (Direction::YDown, Direction::XUp) => |c| (c >> 8) | ((FLIPPED(c) << 8) & 0xFF00),
+        // CW rotation
+        (Direction::XUp, Direction::YDown)
+        | (Direction::YDown, Direction::XDown)
+        | (Direction::XDown, Direction::YUp)
+        | (Direction::YUp, Direction::XUp) => |c| (c << 8) | ((FLIPPED(c) >> 8) & 0x00FF),
+        // No change
+        (Direction::XUp, Direction::XUp)
+        | (Direction::XDown, Direction::XDown)
+        | (Direction::YUp, Direction::YUp)
+        | (Direction::YDown, Direction::YDown) => unreachable!(),
+    };
+    cluster
+        .iter_mut()
+        .for_each(|pixel| pixel.coord_key = transform(pixel.coord_key))
 }
 
 /// Plot the current snapshot, dispatching on the active [`DisplayConfig`].

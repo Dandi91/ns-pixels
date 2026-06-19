@@ -36,6 +36,12 @@ between 3.3 V ESP and 5 V HUB75!
 The two user buttons (UP / DOWN) are the ones built into the Matrix Portal board,
 on GPIO6 and GPIO7 — these can be remapped as well, see `src/bin/main.rs`.
 
+The Matrix Portal S3 also includes a built-in accelerometer (LIS3DH), wired to the
+ESP over I2C on GPIO16 (SDA) and GPIO17 (SCL). The firmware reads it to auto-rotate
+the display to match the board's orientation. If your board doesn't have an
+accelerometer chip, disable it by commenting out lines `src/bin/main.rs:75-81`;
+to support a different one, adjust `src/accel.rs` according to its datasheet.
+
 ## Data sources
 
 - **Train positions** come from [NDOV Loket](https://www.ndovloket.nl/)'s public ZMQ feed

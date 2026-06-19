@@ -3,6 +3,7 @@
 
 extern crate alloc;
 
+pub mod accel;
 pub mod decompress;
 pub mod display;
 pub mod feed;
