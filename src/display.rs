@@ -389,7 +389,7 @@ fn axis_for(mode: ColorMode) -> Axis {
 }
 
 fn rotate(cluster: &mut ClusterVec, from_dir: Direction, to_dir: Direction) {
-    static FLIPPED: fn(u16) -> u16 = |c| ((64 << 8) | 64) - c;
+    static FLIPPED: fn(u16) -> u16 = |c| ((63 << 8) | 63) - c;
 
     if from_dir == to_dir {
         return;
