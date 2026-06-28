@@ -73,7 +73,6 @@ const RETRY_COOLDOWN: Duration = Duration::from_secs(120);
 /// across every enrichment request in the buffer avoids redoing the TLS
 /// handshake for each one.
 const BASE_URL: &str = "https://gateway.apiportal.ns.nl";
-const API_KEY: &str = env!("NS_API_KEY");
 
 // TLS record buffers (~17 KiB each; required for max TLS fragment).
 const TLS_BUF_LEN: usize = 17 * 1024;
@@ -139,6 +138,7 @@ pub async fn run(
     registry: &'static SharedRegistry,
     queue: &'static NewTrainQueue,
     tls_seed: u64,
+    api_key: &'static str,
 ) {
     log::info!("ns_api enrichment task started");
 
@@ -151,6 +151,11 @@ pub async fn run(
     let tcp_client = TcpClient::new(stack, &tcp_state);
     let dns = DnsSocket::new(stack);
     let mut rng_seed = tls_seed;
+
+    let headers = [
+        ("Ocp-Apim-Subscription-Key", api_key),
+        ("Accept", "application/json"),
+    ];
 
     let mut type_batch: Vec<u32, TYPE_BUFFER_CAP> = Vec::new();
     let mut service_batch: Vec<u32, SERVICE_BUFFER_CAP> = Vec::new();
@@ -206,7 +211,7 @@ pub async fn run(
 
         let mut failed = false;
         for chunk in type_batch.chunks(BATCH_MAX) {
-            match fetch_types_on(&mut resource, http_buf, chunk, registry).await {
+            match fetch_types_on(&mut resource, http_buf, chunk, registry, &headers).await {
                 Ok(applied) => log::info!("ns_api: type batch {}/{} resolved", applied, chunk.len()),
                 Err(e) => {
                     log::warn!("ns_api: type batch {:?} failed: {:?}", chunk, e);
@@ -217,7 +222,7 @@ pub async fn run(
         }
         if !failed {
             for &n in service_batch.iter() {
-                match fetch_service_on(&mut resource, http_buf, n, registry).await {
+                match fetch_service_on(&mut resource, http_buf, n, registry, &headers).await {
                     Ok(s) => log::info!("ns_api: service {} -> {:?}", n, s),
                     Err(e) => {
                         log::warn!("ns_api: service {} failed: {:?}", n, e);
@@ -266,6 +271,7 @@ async fn fetch_types_on<'res, C>(
     http_buf: &mut [u8],
     batch: &[u32],
     registry: &SharedRegistry,
+    headers: &[(&str, &str)],
 ) -> Result<usize, FetchError>
 where
     C: Read + Write,
@@ -282,10 +288,9 @@ where
         let _ = write!(path, "{}", id);
     }
 
-    let headers = [("Ocp-Apim-Subscription-Key", API_KEY), ("Accept", "application/json")];
     let resp = resource
         .get(&path)
-        .headers(&headers)
+        .headers(headers)
         .send(http_buf)
         .await
         .map_err(FetchError::Http)?;
@@ -334,6 +339,7 @@ async fn fetch_service_on<'res, C>(
     http_buf: &mut [u8],
     number: u32,
     registry: &SharedRegistry,
+    headers: &[(&str, &str)],
 ) -> Result<ServiceType, FetchError>
 where
     C: Read + Write,
@@ -341,10 +347,9 @@ where
     let mut path: String<128> = String::new();
     let _ = write!(path, "/reisinformatie-api/api/v2/journey?train={number}");
 
-    let headers = [("Ocp-Apim-Subscription-Key", API_KEY), ("Accept", "application/json")];
     let resp = resource
         .get(&path)
-        .headers(&headers)
+        .headers(headers)
         .send(http_buf)
         .await
         .map_err(FetchError::Http)?;

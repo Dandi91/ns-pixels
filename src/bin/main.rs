@@ -45,6 +45,7 @@ macro_rules! mk_static {
 
 const SSID: &str = env!("SSID");
 const PASSWORD: &str = env!("PASSWORD");
+const API_KEY: &str = env!("NS_API_KEY");
 
 #[esp_rtos::main]
 async fn main(spawner: Spawner) -> ! {
@@ -137,7 +138,7 @@ async fn main(spawner: Spawner) -> ! {
     let registry: &'static SharedRegistry = mk_static!(SharedRegistry, Registry::new().into());
     let queue: &'static NewTrainQueue = mk_static!(NewTrainQueue, NewTrainQueue::new());
     spawner.spawn(feed::run(stack, registry, queue).unwrap());
-    spawner.spawn(ns_api::run(stack, registry, queue, seed).unwrap());
+    spawner.spawn(ns_api::run(stack, registry, queue, seed, API_KEY).unwrap());
 
     // Input task. Buttons are NO to GND with internal pull-up — idle high, pressed low.
     let btn_cfg = InputConfig::default().with_pull(Pull::Up);
@@ -200,7 +201,8 @@ fn log_task_future_sizes() {
         Stack<'static>,
         &'static SharedRegistry,
         &'static NewTrainQueue,
-        u64
+        u64,
+        &'static str
     );
     let input = task_future_size!(input::__run_task, Input<'static>, Input<'static>);
     log::info!("  connection: {conn} B");
