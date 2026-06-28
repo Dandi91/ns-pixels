@@ -31,11 +31,12 @@ embassy-embedded-hal = "0.6"
 # --- Networking: wifi/TCP stack + HTTPS client ---
 embassy-net       = { version = "0.9.1", features = ["dhcpv4", "log", "medium-ethernet", "tcp", "dns"] }
 embedded-io-async = "0.7.0"
-# Vendored fork of nerwalt/reqwless#update-to-embedded-tls-0.19 with one extra
-# line: `TlsConfig::enable_rsa_signatures()` so embedded-tls advertises RSA sig
-# algorithms during the handshake. Without it, RSA-only servers (e.g., Azure API
-# Management, where the NS gateway lives) reject with HandshakeFailure since
-# the default config only offers ECDSA P-256.
+# In-tree vendored copy of drogue-iot/reqwless with one extra line in
+# src/client.rs: `enable_rsa_signatures()` so embedded-tls advertises RSA sig
+# algorithms during the handshake. Without it, RSA-only servers (e.g., Azure
+# API Management, where the NS gateway lives) reject with HandshakeFailure
+# since the default config only offers ECDSA P-256. Drop this once a crates.io
+# reqwless release carries the fix.
 reqwless = { path = "vendor/reqwless", default-features = false, features = ["embedded-tls"] }
 
 # --- Display ---
@@ -55,11 +56,6 @@ sequential-storage = "7" # wear-leveled K/V on top of esp-storage's NorFlash
 log         = "0.4.27"
 heapless    = "0.8"
 static_cell = "2.1.1"
-
-[patch.crates-io]
-# reqwless's vendored fork tracks embedded-tls 0.19, which isn't on crates.io
-# yet — patch to git master so the version requirement resolves.
-embedded-tls = { git = "https://github.com/drogue-iot/embedded-tls" }
 
 # Profile tuning: https://doc.rust-lang.org/cargo/reference/profiles.html
 [profile.dev]

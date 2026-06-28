@@ -1,0 +1,41 @@
+name: CI
+
+on:
+  push:
+    # Run on the main branch
+    branches:
+      - main
+    # Releases are tags named 'v<version>', and must have the "major.minor.micro", for example: "0.1.0".
+    # Release candidates are tagged as `v<version>-rc<num>`, for example: "0.1.0-rc1".
+    tags:
+      - "v*"
+  # Also on PRs, just be careful not to publish anything
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+# Cancel any currently running workflows from the same PR, branch, or
+# tag when a new workflow is triggered.
+#
+# https://stackoverflow.com/a/66336834
+concurrency:
+  cancel-in-progress: true
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+
+jobs:
+  ci:
+    runs-on: ubuntu-24.04
+    if: github.event.pull_request.draft == false
+
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Build
+        run: cargo check
+
+      - name: Clippy
+        run: cargo clippy
+
+      - name: Test
+        run: |
+          cargo test
+          cargo test --no-default-features
